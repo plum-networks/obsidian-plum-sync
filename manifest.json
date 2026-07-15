@@ -1,0 +1,10 @@
+{
+  "id": "plum-sync",
+  "name": "Plum Box Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sync your vault to your own Plum Box. You sign in on Plum's own page, so this plugin never sees your password — only a scoped token you can revoke.",
+  "author": "Plum",
+  "authorUrl": "https://plumbox.me",
+  "isDesktopOnly": false
+}

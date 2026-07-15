@@ -1,0 +1,9 @@
+node_modules/
+main.js
+*.js.map
+data.json
+.DS_Store
+
+# local build artifacts / handoff bundles
+dist-plugin/
+*.zip
