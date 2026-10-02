@@ -7,3 +7,4 @@ data.json
 # local build artifacts / handoff bundles
 dist-plugin/
 *.zip
+.test-dist/

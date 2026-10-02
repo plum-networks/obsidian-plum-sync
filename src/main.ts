@@ -28,14 +28,14 @@ export default class PlumSyncPlugin extends Plugin {
     });
 
     this.addRibbonIcon("refresh-cw", "Plum: sync now", async () => {
-      await this.engine.run();
+      await this.engine.run({ manual: true });
     });
 
     this.addCommand({
       id: "plum-sync-now",
       name: "Sync now",
       callback: async () => {
-        await this.engine.run();
+        await this.engine.run({ manual: true });
       },
     });
 

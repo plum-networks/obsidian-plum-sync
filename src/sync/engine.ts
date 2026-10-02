@@ -1,8 +1,11 @@
 import { Notice, TFile, normalizePath } from "obsidian";
-import type { DriveEntry } from "@plumbox/client";
+import type { PlumClient } from "@plumbox/client";
 import type PlumSyncPlugin from "../main.js";
 import { buildClient } from "../plum.js";
 import { sha256Hex, pool } from "./hash.js";
+import { listRemoteTree, SyncAbortedError, type RemoteEntry } from "./remoteList.js";
+
+export { ListingIncompleteError, SyncAbortedError } from "./remoteList.js";
 
 type ActionKind = "upload" | "download" | "delLocal" | "delRemote" | "conflict";
 interface Action {
@@ -49,28 +52,70 @@ function conflictName(rel: string): string {
   return `${base} (conflict ${stamp})${ext}`;
 }
 
+export interface SyncEngineOptions {
+  /** Defaults to the plugin's stored credentials. Tests inject a fake. */
+  makeClient?: () => PlumClient | null;
+}
+
 export class SyncEngine {
   private running = false;
-  constructor(private plugin: PlumSyncPlugin) {}
+  /** Why the last pass stopped, or "" when it completed. */
+  lastError = "";
+
+  constructor(
+    private plugin: PlumSyncPlugin,
+    private opts: SyncEngineOptions = {},
+  ) {}
 
   get isRunning(): boolean {
     return this.running;
   }
 
-  async run(): Promise<SyncResult | null> {
+  /**
+   * One sync pass. Never throws: a pass that cannot run safely (incomplete box
+   * listing, network/auth failure) stops before changing anything, shows a
+   * Notice and leaves `lastError` set. Returns null in that case.
+   *
+   * `manual`: the user asked for this pass, so always show its outcome. An
+   * automatic pass does not repeat the Notice for the same failure.
+   */
+  async run(opts: { manual?: boolean } = {}): Promise<SyncResult | null> {
     if (this.running) {
       new Notice("Plum: a sync is already in progress.");
       return null;
     }
-    const client = buildClient(this.plugin);
+    const client = this.opts.makeClient ? this.opts.makeClient() : buildClient(this.plugin);
     if (!client) {
       new Notice("Plum: not connected. Open settings and Connect first.");
       return null;
     }
+    this.running = true;
+    try {
+      const res = await this.pass(client);
+      this.lastError = "";
+      this.notifySummary(res);
+      return res;
+    } catch (e) {
+      const msg = (e as Error)?.message || String(e);
+      const repeat = msg === this.lastError;
+      this.lastError = msg;
+      console.error("plum-sync: sync stopped", e);
+      if (opts.manual || !repeat) {
+        new Notice(
+          e instanceof SyncAbortedError ? `Plum: ${msg}` : `Plum: sync failed — ${msg}`,
+          10000,
+        );
+      }
+      return null;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async pass(client: PlumClient): Promise<SyncResult> {
     const root = this.plugin.settings.remoteRoot || this.defaultRoot();
     this.plugin.settings.remoteRoot = root;
 
-    this.running = true;
     const res: SyncResult = {
       uploaded: 0,
       downloaded: 0,
@@ -79,76 +124,74 @@ export class SyncEngine {
       conflicts: 0,
       errors: 0,
     };
-    try {
-      await client.drive.ensureDir(root);
+    await client.drive.ensureDir(root);
 
-      // 1) enumerate both sides
-      const localFiles = new Map<string, TFile>();
-      for (const f of this.plugin.app.vault.getFiles()) {
-        localFiles.set(f.path, f);
-      }
-      const remote = new Map<string, DriveEntry>();
-      for await (const e of client.drive.listAll(root, { recursive: true, hash: true })) {
-        if (e.isDir) continue;
-        const rel = relFromRemote(root, e.path);
-        if (rel) remote.set(rel, e);
-      }
-
-      // 2) local hashes (reuse the base snapshot when mtime is unchanged)
-      const base = this.plugin.settings.base;
-      const localHash = new Map<string, string>();
-      for (const [rel, f] of localFiles) {
-        const snap = base[rel];
-        if (snap && snap.mtime === f.stat.mtime) {
-          localHash.set(rel, snap.hash);
-        } else {
-          const buf = await this.plugin.app.vault.adapter.readBinary(f.path);
-          localHash.set(rel, await sha256Hex(buf));
-        }
-      }
-
-      // 3) 3-way classification
-      const actions: Action[] = [];
-      const allRels = new Set<string>([...localFiles.keys(), ...remote.keys()]);
-      for (const rel of allRels) {
-        const L = localHash.has(rel);
-        const R = remote.has(rel);
-        const B = base[rel]?.hash;
-        const lh = localHash.get(rel);
-        const rh = remote.get(rel)?.hash; // may be undefined for legacy remote files
-
-        if (L && !R) {
-          actions.push({ kind: B ? "delLocal" : "upload", rel });
-        } else if (!L && R) {
-          actions.push({ kind: B ? "delRemote" : "download", rel });
-        } else if (L && R) {
-          if (rh !== undefined && lh === rh) continue; // identical → noop
-          const localChanged = lh !== B;
-          const remoteChanged = rh === undefined ? true : rh !== B;
-          if (localChanged && !remoteChanged) actions.push({ kind: "upload", rel });
-          else if (!localChanged && remoteChanged) actions.push({ kind: "download", rel });
-          else actions.push({ kind: "conflict", rel });
-        }
-      }
-
-      // 4) execute
-      await pool(actions, 4, async (a) => {
-        try {
-          await this.exec(a, client, root, localHash);
-          this.tally(res, a.kind);
-        } catch (e) {
-          res.errors++;
-          console.error(`plum-sync: ${a.kind} ${a.rel} failed`, e);
-        }
-      });
-
-      this.plugin.settings.lastSync = Date.now();
-      await this.plugin.saveSettings();
-      this.notifySummary(res);
-      return res;
-    } finally {
-      this.running = false;
+    // 1) enumerate both sides. The listing throws on any failed or
+    //    incomplete answer (503 listing_incomplete, pages that don't add
+    //    up) — nothing below runs on a partial view of the box.
+    const localFiles = new Map<string, TFile>();
+    for (const f of this.plugin.app.vault.getFiles()) {
+      localFiles.set(f.path, f);
     }
+    const entries = await listRemoteTree(client.drive, root);
+    const remote = new Map<string, RemoteEntry>();
+    for (const e of entries) {
+      if (e.isDir) continue;
+      const rel = relFromRemote(root, e.path);
+      if (rel) remote.set(rel, e); // `remote: true` (peer-held) is present like any file
+    }
+
+    // 2) local hashes (reuse the base snapshot when mtime is unchanged)
+    const base = this.plugin.settings.base;
+    const localHash = new Map<string, string>();
+    for (const [rel, f] of localFiles) {
+      const snap = base[rel];
+      if (snap && snap.mtime === f.stat.mtime) {
+        localHash.set(rel, snap.hash);
+      } else {
+        const buf = await this.plugin.app.vault.adapter.readBinary(f.path);
+        localHash.set(rel, await sha256Hex(buf));
+      }
+    }
+
+    // 3) 3-way classification
+    const actions: Action[] = [];
+    const allRels = new Set<string>([...localFiles.keys(), ...remote.keys()]);
+    for (const rel of allRels) {
+      const L = localHash.has(rel);
+      const R = remote.has(rel);
+      const B = base[rel]?.hash;
+      const lh = localHash.get(rel);
+      const rh = remote.get(rel)?.hash; // may be undefined for legacy remote files
+
+      if (L && !R) {
+        actions.push({ kind: B ? "delLocal" : "upload", rel });
+      } else if (!L && R) {
+        actions.push({ kind: B ? "delRemote" : "download", rel });
+      } else if (L && R) {
+        if (rh !== undefined && lh === rh) continue; // identical → noop
+        const localChanged = lh !== B;
+        const remoteChanged = rh === undefined ? true : rh !== B;
+        if (localChanged && !remoteChanged) actions.push({ kind: "upload", rel });
+        else if (!localChanged && remoteChanged) actions.push({ kind: "download", rel });
+        else actions.push({ kind: "conflict", rel });
+      }
+    }
+
+    // 4) execute
+    await pool(actions, 4, async (a) => {
+      try {
+        await this.exec(a, client, root, localHash);
+        this.tally(res, a.kind);
+      } catch (e) {
+        res.errors++;
+        console.error(`plum-sync: ${a.kind} ${a.rel} failed`, e);
+      }
+    });
+
+    this.plugin.settings.lastSync = Date.now();
+    await this.plugin.saveSettings();
+    return res;
   }
 
   private tally(res: SyncResult, kind: ActionKind): void {
@@ -161,7 +204,7 @@ export class SyncEngine {
 
   private async exec(
     a: Action,
-    client: NonNullable<ReturnType<typeof buildClient>>,
+    client: PlumClient,
     root: string,
     localHash: Map<string, string>,
   ): Promise<void> {

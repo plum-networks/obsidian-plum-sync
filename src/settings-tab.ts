@@ -91,15 +91,16 @@ export class PlumSyncSettingTab extends PluginSettingTab {
     const lastSync = this.plugin.settings.lastSync
       ? new Date(this.plugin.settings.lastSync).toLocaleString()
       : "never";
+    const lastError = this.plugin.engine.lastError;
     new Setting(containerEl)
       .setName("Sync now")
-      .setDesc(`Last sync: ${lastSync}`)
+      .setDesc(`Last sync: ${lastSync}${lastError ? ` · Last attempt stopped: ${lastError}` : ""}`)
       .addButton((b) =>
         b
           .setButtonText("Sync now")
           .setDisabled(!connected)
           .onClick(async () => {
-            await this.plugin.engine.run();
+            await this.plugin.engine.run({ manual: true });
             this.display();
           }),
       );
