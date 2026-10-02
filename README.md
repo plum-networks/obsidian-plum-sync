@@ -12,6 +12,26 @@ You sign in on **plumbox.me** in your browser (like "Sign in with Google"), so *
 
 Sync runs when you click **Sync now** (ribbon or command palette), on a timer (default every 15 min), and a few seconds after you edit the vault.
 
+## Deletion safety
+
+A note missing on one side is deleted on the other only when the box's file list
+is known to be complete and the surviving copy is exactly what was last synced.
+
+- **Incomplete box listing** (the box answers `503 listing_incomplete`, or the
+  pages don't add up): the sync stops before changing anything and a notice
+  says why.
+- **Mass deletion**: if one side would lose more than
+  `max(10, min(50, 10% of synced files))` files in one sync, those deletions are
+  paused and a dialog asks **Delete N files** or **Keep files** (re-upload /
+  re-download). Everything else still syncs. Closing the dialog keeps them
+  paused; run **Plum Box Sync: Review paused deletions** to decide later.
+- **Edit vs delete**: an edit always wins; the edited copy is synced back.
+- **Hidden files** (`.obsidian/`, anything starting with `.`) and notes that
+  cannot be read are left alone, never treated as deleted. The first sync waits
+  until Obsidian has finished loading the vault.
+- **Changing the remote folder or account** starts from a fresh baseline: that
+  sync can upload, download or keep both copies, but not delete.
+
 ## Security
 
 - The password is entered **only** on `plumbox.me`, in your system browser — never inside Obsidian. This plugin receives a token, not credentials.
@@ -21,7 +41,7 @@ Sync runs when you click **Sync now** (ribbon or command palette), on a timer (d
 
 ## Install (manual, during development)
 
-1. Build: `npm install && npm run build`.
+1. Build: `npm install && npm run build` (tests: `npm test`).
 2. Copy `manifest.json`, `main.js`, `versions.json` into `<vault>/.obsidian/plugins/plum-sync/`.
 3. Enable **Plum Box Sync** in Settings → Community plugins.
 

@@ -35,6 +35,16 @@ None blocked the MVP.
    batch `remove`/`move` would cut round-trips on large reorganizations.
 6. **`onProgress` exists for upload but not download.** Large attachment
    downloads can't show progress.
+7. **`listAll` can end early without saying so.** It stops on the first empty
+   page even when `offset < total`, and offset paging over a tree that changes
+   between pages can skip entries. A sync client treats a skipped entry as
+   deleted, so the plugin pages `list` itself and checks the pages add up to
+   `total` (`src/sync/remoteList.ts`). A snapshot/cursor for recursive listings
+   would make this exact.
+8. **No conditional delete.** `remove(path)` cannot say "only if the content
+   hash is still X", so a remote edit that lands between listing and delete is
+   moved to the box trash (recoverable, but not what the user meant). An
+   `If-Match: <hash>` on delete (and on overwrite upload) would close this.
 
 ## Deferred by design (v1)
 
