@@ -516,3 +516,70 @@ describe("SyncEngine: a save made during the pass is never lost (R3-MOB-003)", (
     assert.equal(vault.read(note(0)), "box edit");
   });
 });
+
+describe("SyncEngine: a conflict keeps both copies (DS-03)", () => {
+  it("the box's version survives later passes, in the vault and on the box", async () => {
+    const engine = engineFor();
+    await settled(engine, 1);
+    vault.write(note(0), "edited here");
+    drive.put(note(0), "edited on the box");
+    const r1 = await engine.run();
+    assert.ok(r1);
+    assert.equal(r1.conflicts, 1);
+    const [copy] = conflictCopies();
+    assert.ok(copy);
+    assert.equal(vault.read(copy), "edited on the box");
+    assert.equal(boxText(copy), "edited on the box", "the copy is on the box too");
+    assert.equal(boxText(note(0)), "edited here");
+
+    for (let pass = 0; pass < 2; pass++) {
+      const r = await engine.run();
+      assert.ok(r);
+      assert.equal(r.deletedLocal + r.deletedRemote + r.uploaded + r.downloaded, 0, "settled");
+    }
+    assert.equal(vault.read(copy), "edited on the box");
+    assert.equal(boxText(copy), "edited on the box");
+    assert.deepEqual(vault.trashed, [], "nothing went to the trash");
+  });
+
+  it("a second conflict on the same note does not overwrite the first copy", async () => {
+    const engine = engineFor();
+    await settled(engine, 1);
+    vault.write(note(0), "here 1");
+    drive.put(note(0), "box 1");
+    await engine.run();
+    vault.write(note(0), "here 2");
+    drive.put(note(0), "box 2");
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.conflicts, 1);
+    const copies = conflictCopies();
+    assert.equal(copies.length, 2);
+    assert.deepEqual(copies.map((c) => vault.read(c)).sort(), ["box 1", "box 2"]);
+    assert.deepEqual(copies.map(boxText).sort(), ["box 1", "box 2"]);
+    assert.equal(vault.read(note(0)), "here 2");
+  });
+
+  it("a copy whose upload failed is uploaded by the next pass, not deleted", async () => {
+    const engine = engineFor();
+    await settled(engine, 1);
+    vault.write(note(0), "edited here");
+    drive.put(note(0), "edited on the box");
+    const upload = drive.upload.bind(drive);
+    drive.upload = async (path, data) => {
+      if (path.includes("(conflict ")) throw new PlumApiError(500, "disk full");
+      return upload(path, data);
+    };
+    const r1 = await engine.run();
+    assert.ok(r1);
+    assert.equal(r1.errors, 1);
+    drive.upload = upload;
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedLocal, 0);
+    assert.equal(r2.uploaded, 1);
+    const [copy] = conflictCopies();
+    assert.ok(copy);
+    assert.equal(boxText(copy), "edited on the box");
+  });
+});

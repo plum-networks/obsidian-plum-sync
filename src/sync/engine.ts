@@ -55,15 +55,18 @@ function parentOf(path: string): string {
   const i = path.lastIndexOf("/");
   return i <= 0 ? "" : path.slice(0, i);
 }
-function conflictName(rel: string): string {
-  const now = new Date();
-  const stamp =
+function conflictStamp(now = new Date()): string {
+  return (
     `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}` +
-    ` ${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
+    ` ${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`
+  );
+}
+/** "a/b (conflict 2026-10-02 1430).md", or "… 1430 2).md" for the n-th one that minute. */
+function conflictName(rel: string, stamp: string, n: number): string {
   const dot = rel.lastIndexOf(".");
   const base = dot > rel.lastIndexOf("/") ? rel.slice(0, dot) : rel;
   const ext = dot > rel.lastIndexOf("/") ? rel.slice(dot) : "";
-  return `${base} (conflict ${stamp})${ext}`;
+  return `${base} (conflict ${stamp}${n > 1 ? ` ${n}` : ""})${ext}`;
 }
 
 /**
@@ -270,7 +273,7 @@ export class SyncEngine {
     // 4) execute
     await pool(guarded.run, 4, async (a) => {
       try {
-        const done = await this.exec(a, client, root, localHash, seenMtime);
+        const done = await this.exec(a, client, root, localHash, seenMtime, remote);
         if (done) this.tally(res, a.kind);
         else res.skipped++;
       } catch (e) {
@@ -325,6 +328,7 @@ export class SyncEngine {
     root: string,
     localHash: Map<string, string>,
     seenMtime: Map<string, number>,
+    remote: ReadonlyMap<string, RemoteEntry>,
   ): Promise<boolean> {
     const base = this.plugin.settings.base;
     const remotePath = remotePathFor(root, a.rel);
@@ -362,17 +366,20 @@ export class SyncEngine {
       await client.drive.remove(remotePath); // → box trash, recoverable
       delete base[a.rel];
     } else if (a.kind === "conflict") {
-      // Keep both: pull the remote copy to a conflict-named local file, and push
-      // our local version to the canonical path. Neither side loses data; the
-      // conflict copy propagates on the next sync.
+      // Keep both: ours stays at the canonical path on both sides; the box's
+      // version becomes a conflict-named copy — in the vault AND on the box
+      // (DS-03). The copy enters the base only once the box has it: a base
+      // entry for a file the box never had reads as "deleted on the box", and
+      // the next pass trashed the copy the user had just been told was kept.
       const remoteBuf = await client.drive.download(remotePath);
-      const cRel = conflictName(a.rel);
-      await this.writeLocal(cRel, remoteBuf);
-      base[cRel] = { hash: await sha256Hex(remoteBuf), mtime: (await this.mtime(cRel)) ?? Date.now() };
+      const cRel = await this.writeConflictCopy(a.rel, remoteBuf, (r) => remote.has(r) || r in base);
 
       const sent = await this.readForUpload(a.rel);
       await client.drive.upload(remotePath, sent.buf, { overwrite: true });
       base[a.rel] = sent.snapshot;
+
+      await client.drive.upload(remotePathFor(root, cRel), remoteBuf, { overwrite: true });
+      base[cRel] = { hash: await sha256Hex(remoteBuf), mtime: (await this.mtime(cRel)) ?? Date.now() };
       new Notice(`Plum: conflict on "${a.rel}" — kept both copies.`);
     }
     return true;
@@ -417,6 +424,25 @@ export class SyncEngine {
     const mtime = (await this.mtime(rel)) ?? 0;
     const buf = await this.plugin.app.vault.adapter.readBinary(rel);
     return { buf, snapshot: { hash: await sha256Hex(buf), mtime } };
+  }
+
+  /**
+   * Write the box's side of a conflict to a "(conflict …)" name that nothing
+   * in the vault or on the box uses yet. Never replaces a note: a second
+   * conflict on the same note in the same minute gets " 2", and so on.
+   */
+  private async writeConflictCopy(
+    rel: string,
+    buf: ArrayBuffer,
+    taken: (rel: string) => boolean,
+  ): Promise<string> {
+    const stamp = conflictStamp();
+    for (let n = 1; n <= 1000; n++) {
+      const cRel = conflictName(rel, stamp, n);
+      if (taken(cRel)) continue;
+      if (await this.writeLocal(cRel, buf, () => this.asScanned(cRel, undefined))) return cRel;
+    }
+    throw new Error(`no free conflict name for "${rel}"`);
   }
 
   private async ensureLocalDir(dir: string): Promise<void> {

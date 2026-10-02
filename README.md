@@ -50,7 +50,7 @@ is known to be complete and the surviving copy is exactly what was last synced.
 
 ## Conflict handling
 
-If a note changed on **both** the box and this device since the last sync, the plugin keeps both: your local version stays at the original name, and the box's version is written alongside as `note (conflict <date>).md`. Nothing is lost; you merge and delete the extra copy.
+If a note changed on **both** the box and this device since the last sync, the plugin keeps both: your local version stays at the original name, and the box's version is written alongside as `note (conflict <date>).md` — in the vault and on the box. A second conflict on the same note within the minute gets `… 2).md`. Nothing is lost; you merge and delete the extra copy.
 
 ## Built on `@plumbox/client`
 
