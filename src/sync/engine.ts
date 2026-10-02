@@ -3,15 +3,19 @@ import type { PlumClient } from "@plumbox/client";
 import type PlumSyncPlugin from "../main.js";
 import { buildClient } from "../plum.js";
 import { sha256Hex, pool } from "./hash.js";
+import {
+  guardDeletions,
+  planSync,
+  type Action,
+  type ActionKind,
+  type DeletionGuardConfig,
+  type DeletionSide,
+  type HeldDeletions,
+} from "./plan.js";
 import { listRemoteTree, SyncAbortedError, type RemoteEntry } from "./remoteList.js";
 
 export { ListingIncompleteError, SyncAbortedError } from "./remoteList.js";
-
-type ActionKind = "upload" | "download" | "delLocal" | "delRemote" | "conflict";
-interface Action {
-  kind: ActionKind;
-  rel: string;
-}
+export type { DeletionSide, HeldDeletions } from "./plan.js";
 
 export interface SyncResult {
   uploaded: number;
@@ -20,6 +24,12 @@ export interface SyncResult {
   deletedRemote: number;
   conflicts: number;
   errors: number;
+  /**
+   * Deletions withheld by the mass-deletion guard, waiting for the user:
+   * `local` would delete notes in this vault (missing on the box),
+   * `remote` would delete files on the box (missing in this vault).
+   */
+  held: HeldDeletions;
 }
 
 // --- path helpers (vault paths are "/"-separated, no leading slash; drive
@@ -52,13 +62,24 @@ function conflictName(rel: string): string {
   return `${base} (conflict ${stamp})${ext}`;
 }
 
+type PerSide<T> = { local: T; remote: T };
+const emptySets = (): PerSide<Set<string>> => ({ local: new Set(), remote: new Set() });
+
 export interface SyncEngineOptions {
   /** Defaults to the plugin's stored credentials. Tests inject a fake. */
   makeClient?: () => PlumClient | null;
+  /** Mass-deletion guard thresholds; defaults to DEFAULT_DELETION_GUARD. */
+  deletionGuard?: DeletionGuardConfig;
 }
 
 export class SyncEngine {
   private running = false;
+  /** Deletions the guard withheld on the last pass, awaiting the user. */
+  private held: HeldDeletions = { local: [], remote: [] };
+  /** User said "delete": these may be deleted on the next pass. */
+  private approved = emptySets();
+  /** User said "keep": forget their base on the next pass. */
+  private keep = emptySets();
   /** Why the last pass stopped, or "" when it completed. */
   lastError = "";
 
@@ -69,6 +90,28 @@ export class SyncEngine {
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  get heldDeletions(): HeldDeletions {
+    return { local: [...this.held.local], remote: [...this.held.remote] };
+  }
+
+  /**
+   * Record the user's answer for deletions the guard held back. It takes
+   * effect at the start of the next pass, never mid-pass, so that pass
+   * re-checks everything first.
+   *
+   * - "delete": the next pass may delete exactly these paths — and only if it
+   *   still plans to.
+   * - "keep": their base entries are dropped, so the side that still has the
+   *   file wins: missing on the box → re-uploaded, missing here → re-downloaded.
+   *   Nothing is deleted.
+   */
+  decide(side: DeletionSide, choice: "delete" | "keep", rels: string[] = this.held[side]): void {
+    const target = choice === "delete" ? this.approved[side] : this.keep[side];
+    for (const r of rels) target.add(r);
+    const done = new Set(rels);
+    this.held[side] = this.held[side].filter((r) => !done.has(r));
   }
 
   /**
@@ -94,6 +137,9 @@ export class SyncEngine {
       const res = await this.pass(client);
       this.lastError = "";
       this.notifySummary(res);
+      if (res.held.local.length || res.held.remote.length) {
+        this.plugin.promptHeldDeletions?.(false);
+      }
       return res;
     } catch (e) {
       const msg = (e as Error)?.message || String(e);
@@ -113,8 +159,9 @@ export class SyncEngine {
   }
 
   private async pass(client: PlumClient): Promise<SyncResult> {
-    const root = this.plugin.settings.remoteRoot || this.defaultRoot();
-    this.plugin.settings.remoteRoot = root;
+    const settings = this.plugin.settings;
+    const root = settings.remoteRoot || this.defaultRoot();
+    settings.remoteRoot = root;
 
     const res: SyncResult = {
       uploaded: 0,
@@ -123,14 +170,17 @@ export class SyncEngine {
       deletedRemote: 0,
       conflicts: 0,
       errors: 0,
+      held: { local: [], remote: [] },
     };
+    const vault = this.plugin.app.vault;
+
     await client.drive.ensureDir(root);
 
-    // 1) enumerate both sides. The listing throws on any failed or
-    //    incomplete answer (503 listing_incomplete, pages that don't add
-    //    up) — nothing below runs on a partial view of the box.
+    // 1) enumerate both sides. The listing throws on any failed or incomplete
+    //    answer (503 listing_incomplete, pages that don't add up) — nothing
+    //    below runs on a partial view of the box.
     const localFiles = new Map<string, TFile>();
-    for (const f of this.plugin.app.vault.getFiles()) {
+    for (const f of vault.getFiles()) {
       localFiles.set(f.path, f);
     }
     const entries = await listRemoteTree(client.drive, root);
@@ -142,46 +192,35 @@ export class SyncEngine {
     }
 
     // 2) local hashes (reuse the base snapshot when mtime is unchanged)
-    const base = this.plugin.settings.base;
+    const base = settings.base;
+    this.applyKeep(base);
     const localHash = new Map<string, string>();
     for (const [rel, f] of localFiles) {
       const snap = base[rel];
       if (snap && snap.mtime === f.stat.mtime) {
         localHash.set(rel, snap.hash);
       } else {
-        const buf = await this.plugin.app.vault.adapter.readBinary(f.path);
+        const buf = await vault.adapter.readBinary(f.path);
         localHash.set(rel, await sha256Hex(buf));
       }
     }
 
-    // 3) 3-way classification
-    const actions: Action[] = [];
-    const allRels = new Set<string>([...localFiles.keys(), ...remote.keys()]);
-    for (const rel of allRels) {
-      const L = localHash.has(rel);
-      const R = remote.has(rel);
-      const B = base[rel]?.hash;
-      const lh = localHash.get(rel);
-      const rh = remote.get(rel)?.hash; // may be undefined for legacy remote files
-
-      if (L && !R) {
-        actions.push({ kind: B ? "delLocal" : "upload", rel });
-      } else if (!L && R) {
-        actions.push({ kind: B ? "delRemote" : "download", rel });
-      } else if (L && R) {
-        if (rh !== undefined && lh === rh) continue; // identical → noop
-        const localChanged = lh !== B;
-        const remoteChanged = rh === undefined ? true : rh !== B;
-        if (localChanged && !remoteChanged) actions.push({ kind: "upload", rel });
-        else if (!localChanged && remoteChanged) actions.push({ kind: "download", rel });
-        else actions.push({ kind: "conflict", rel });
-      }
-    }
+    // 3) 3-way classification + mass-deletion guard
+    const planned = planSync({ local: localHash, remote, base });
+    const guarded = guardDeletions(
+      planned,
+      Object.keys(base).length,
+      this.approved,
+      this.opts.deletionGuard,
+    );
+    this.approved = emptySets();
+    this.held = guarded.held;
+    res.held = this.heldDeletions;
 
     // 4) execute
-    await pool(actions, 4, async (a) => {
+    await pool(guarded.run, 4, async (a) => {
       try {
-        await this.exec(a, client, root, localHash);
+        await this.exec(a, client, root, localHash, localFiles);
         this.tally(res, a.kind);
       } catch (e) {
         res.errors++;
@@ -189,9 +228,16 @@ export class SyncEngine {
       }
     });
 
-    this.plugin.settings.lastSync = Date.now();
+    settings.lastSync = Date.now();
     await this.plugin.saveSettings();
     return res;
+  }
+
+  private applyKeep(base: Record<string, unknown>): void {
+    for (const side of ["local", "remote"] as const) {
+      for (const rel of this.keep[side]) delete base[rel];
+    }
+    this.keep = emptySets();
   }
 
   private tally(res: SyncResult, kind: ActionKind): void {
@@ -207,12 +253,17 @@ export class SyncEngine {
     client: PlumClient,
     root: string,
     localHash: Map<string, string>,
+    localFiles: Map<string, TFile>,
   ): Promise<void> {
     const base = this.plugin.settings.base;
     const remotePath = remotePathFor(root, a.rel);
     const vault = this.plugin.app.vault;
 
-    if (a.kind === "upload") {
+    if (a.kind === "adopt") {
+      base[a.rel] = { hash: localHash.get(a.rel)!, mtime: localFiles.get(a.rel)?.stat.mtime ?? Date.now() };
+    } else if (a.kind === "forget") {
+      delete base[a.rel];
+    } else if (a.kind === "upload") {
       const buf = await vault.adapter.readBinary(a.rel);
       const dir = parentOf(remotePath);
       if (dir) await client.drive.ensureDir(dir);
@@ -279,6 +330,8 @@ export class SyncEngine {
     if (r.deletedLocal) parts.push(`🗑local ${r.deletedLocal}`);
     if (r.conflicts) parts.push(`⚠${r.conflicts} conflict`);
     if (r.errors) parts.push(`✗${r.errors} error`);
+    const held = r.held.local.length + r.held.remote.length;
+    if (held) parts.push(`⏸${held} deletions paused`);
     new Notice(`Plum sync: ${parts.length ? parts.join("  ") : "already up to date"}`);
   }
 

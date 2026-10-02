@@ -250,3 +250,97 @@ describe("SyncEngine: incomplete listings", () => {
     assert.ok(vault.has(note(1)) && vault.has(note(2)));
   });
 });
+
+describe("SyncEngine: mass-deletion guard", () => {
+  it("applies deletions at or below the limit", async () => {
+    const engine = engineFor();
+    await settled(engine, 30); // limit = 10
+    for (let i = 0; i < 10; i++) drive.drop(note(i));
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.deletedLocal, 10);
+    assert.equal(vault.trashed.length, 10);
+    assert.equal(plugin.prompts, 0);
+  });
+
+  it("holds local deletions above the limit, asks, and still syncs the rest", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    for (let i = 0; i < 11; i++) drive.drop(note(i));
+    vault.write("new.md", "fresh");
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.deletedLocal, 0);
+    assert.equal(r.held.local.length, 11);
+    assert.deepEqual(vault.trashed, []);
+    assert.equal(plugin.prompts, 1, "the user is asked");
+    assert.ok(drive.has("new.md"));
+  });
+
+  it("holds box deletions when the vault looks emptied (DS-04)", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    vault.removeUnder("notes");
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.held.remote.length, 30);
+    assert.deepEqual(drive.removed, []);
+  });
+
+  it("user chooses Delete: the next pass deletes exactly the held notes", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    for (let i = 0; i < 12; i++) drive.drop(note(i));
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("local", "delete", r1.held.local);
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedLocal, 12);
+    assert.equal(vault.trashed.length, 12);
+    assert.ok(vault.has(note(12)));
+  });
+
+  it("user chooses Keep for notes missing on the box: they are re-uploaded", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    for (let i = 0; i < 12; i++) drive.drop(note(i));
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("local", "keep");
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedLocal, 0);
+    assert.equal(r2.uploaded, 12);
+    assert.ok(drive.has(note(0)));
+    const r3 = await engine.run();
+    assert.ok(r3);
+    assert.equal(r3.uploaded + r3.downloaded + r3.deletedLocal + r3.deletedRemote, 0);
+  });
+
+  it("user chooses Keep for notes missing here: they are re-downloaded", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    vault.removeUnder("notes");
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("remote", "keep", r1.held.remote);
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.downloaded, 30);
+    assert.deepEqual(drive.removed, []);
+    assert.equal(vault.read(note(29)), "note 29");
+  });
+
+  it("user chooses Delete for notes missing here: they go to the box trash", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    vault.removeUnder("notes");
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("remote", "delete", r1.held.remote);
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedRemote, 30);
+  });
+});

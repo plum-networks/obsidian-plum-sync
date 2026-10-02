@@ -1,7 +1,8 @@
-import { Plugin, type ObsidianProtocolData } from "obsidian";
+import { Notice, Plugin, type ObsidianProtocolData } from "obsidian";
 import { DEFAULT_SETTINGS, type PlumSyncSettings } from "./types.js";
 import { PlumSyncSettingTab } from "./settings-tab.js";
-import { SyncEngine } from "./sync/engine.js";
+import { SyncEngine, type DeletionSide } from "./sync/engine.js";
+import { HeldDeletionModal, type DeletionChoice } from "./deletion-modal.js";
 import { completeConnect, isConnected } from "./plum.js";
 import { parseCallback } from "@plumbox/client";
 
@@ -13,6 +14,9 @@ export default class PlumSyncPlugin extends Plugin {
 
   private autoSyncTimer: number | null = null;
   private changeTimer: number | null = null;
+  private deletionPromptOpen = false;
+  /** Last held set we asked about, per side — so each pass doesn't re-ask. */
+  private promptedHeld: Record<DeletionSide, string> = { local: "", remote: "" };
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -36,6 +40,19 @@ export default class PlumSyncPlugin extends Plugin {
       name: "Sync now",
       callback: async () => {
         await this.engine.run({ manual: true });
+      },
+    });
+
+    this.addCommand({
+      id: "plum-review-paused-deletions",
+      name: "Review paused deletions",
+      callback: () => {
+        const held = this.engine.heldDeletions;
+        if (!held.local.length && !held.remote.length) {
+          new Notice("Plum: no deletions are waiting for you.");
+          return;
+        }
+        this.promptHeldDeletions(true);
       },
     });
 
@@ -81,6 +98,45 @@ export default class PlumSyncPlugin extends Plugin {
       );
       this.registerInterval(this.autoSyncTimer);
     }
+  }
+
+  /**
+   * Ask about deletions the mass-deletion guard held back, one side at a
+   * time. Closing the modal keeps them paused ("Review paused deletions"
+   * reopens it). After a choice, sync again so it takes effect.
+   */
+  promptHeldDeletions(force: boolean, asked: ReadonlySet<DeletionSide> = new Set()): void {
+    if (this.deletionPromptOpen) return;
+    const held = this.engine.heldDeletions;
+    const side = (["remote", "local"] as const).find((s) => {
+      const rels = held[s];
+      if (!rels.length || asked.has(s)) return false;
+      return force || this.promptedHeld[s] !== rels.join("\n");
+    });
+    if (!side) return;
+    const rels = held[side];
+    this.promptedHeld[side] = rels.join("\n");
+    this.deletionPromptOpen = true;
+    new Notice(`Plum: paused deleting ${rels.length} files — waiting for your choice.`, 10000);
+    new HeldDeletionModal(this.app, side, rels, this.settings.remoteRoot, (choice: DeletionChoice) => {
+      this.deletionPromptOpen = false;
+      if (choice) {
+        this.engine.decide(side, choice, rels);
+        this.syncWhenIdle();
+      }
+      // Ask about the other side too, if it is also waiting.
+      this.promptHeldDeletions(force, new Set([...asked, side]));
+    }).open();
+  }
+
+  /** Run a sync as soon as the current one (if any) has finished. */
+  private syncWhenIdle(): void {
+    if (!this.engine.isRunning) {
+      void this.engine.run();
+      return;
+    }
+    const t = window.setTimeout(() => this.syncWhenIdle(), 1000);
+    this.registerInterval(t);
   }
 
   /** Debounced sync after vault edits. */

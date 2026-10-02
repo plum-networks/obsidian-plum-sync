@@ -104,5 +104,19 @@ export class PlumSyncSettingTab extends PluginSettingTab {
             this.display();
           }),
       );
+
+    const held = this.plugin.engine.heldDeletions;
+    const heldCount = held.local.length + held.remote.length;
+    if (heldCount) {
+      new Setting(containerEl)
+        .setName("Paused deletions")
+        .setDesc(`${heldCount} deletions are waiting for your choice. Nothing is deleted until you decide.`)
+        .addButton((b) =>
+          b
+            .setButtonText("Review")
+            .setWarning()
+            .onClick(() => this.plugin.promptHeldDeletions(true)),
+        );
+    }
   }
 }
