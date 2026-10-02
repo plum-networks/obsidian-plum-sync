@@ -38,7 +38,13 @@ export interface PlanInput {
   base: Readonly<Record<string, { hash: string }>>;
 }
 
-/** 3-way classification against the last-sync base. */
+/**
+ * 3-way classification against the last-sync base.
+ *
+ * Deletion propagates only when the surviving side is exactly what we last
+ * synced. A file edited on one side and deleted on the other keeps the edit
+ * (it is re-uploaded / re-downloaded) — an edit always beats a delete.
+ */
 export function planSync(input: PlanInput): Action[] {
   const { local, remote, base } = input;
   const out: Action[] = [];
@@ -53,9 +59,13 @@ export function planSync(input: PlanInput): Action[] {
     const rh = r?.hash ? r.hash : undefined; // "" / missing → unknown
 
     if (L && !R) {
-      out.push({ kind: B !== undefined ? "delLocal" : "upload", rel });
+      if (B === undefined) out.push({ kind: "upload", rel });
+      else if (lh === B) out.push({ kind: "delLocal", rel });
+      else out.push({ kind: "upload", rel }); // edited here since last sync
     } else if (!L && R) {
-      out.push({ kind: B !== undefined ? "delRemote" : "download", rel });
+      if (B === undefined) out.push({ kind: "download", rel });
+      else if (rh !== undefined && rh !== B) out.push({ kind: "download", rel }); // edited on the box
+      else out.push({ kind: "delRemote", rel });
     } else if (L && R) {
       if (rh !== undefined && lh === rh) {
         if (B !== lh) out.push({ kind: "adopt", rel });

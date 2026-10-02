@@ -94,6 +94,8 @@ class FakeDrive {
   files = new Map<string, { data: Uint8Array; remote?: boolean; noHash?: boolean }>();
   removed: string[] = [];
   listError: unknown = null;
+  /** Runs while the listing is in flight (simulates edits during a pass). */
+  onList: (() => void) | null = null;
 
   put(rel: string, content: string, extra: { remote?: boolean; noHash?: boolean } = {}): void {
     this.files.set(`${ROOT}/${rel}`, { data: enc(content), ...extra });
@@ -107,6 +109,8 @@ class FakeDrive {
   async ensureDir(_p: string): Promise<void> {}
   async list(path: string, opts: ListOptions = {}) {
     if (this.listError) throw this.listError;
+    this.onList?.();
+    this.onList = null;
     const prefix = path.replace(/\/+$/, "") + "/";
     const items: Array<DriveEntry & { remote?: boolean }> = [];
     for (const [p, f] of [...this.files].sort(([a], [b]) => a.localeCompare(b))) {
@@ -299,6 +303,43 @@ describe("SyncEngine: mass-deletion guard", () => {
     assert.equal(r2.deletedLocal, 12);
     assert.equal(vault.trashed.length, 12);
     assert.ok(vault.has(note(12)));
+  });
+
+  it("user chooses Delete, but a held note was edited since: the edit is kept", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    for (let i = 0; i < 12; i++) drive.drop(note(i));
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("local", "delete", r1.held.local);
+    vault.write(note(0), "edited after the prompt");
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedLocal, 11);
+    assert.equal(vault.read(note(0)), "edited after the prompt");
+    assert.ok(drive.has(note(0)), "the edit is uploaded back");
+  });
+
+  it("a note edited while the pass runs is not trashed", async () => {
+    const engine = engineFor();
+    await settled(engine, 30);
+    for (let i = 0; i < 12; i++) drive.drop(note(i));
+    const r1 = await engine.run();
+    assert.ok(r1);
+    engine.decide("local", "delete", r1.held.local);
+    // The edit lands after the vault was scanned, so the planner still sees
+    // the old snapshot and plans the delete; the re-check before trashing
+    // must catch it.
+    drive.onList = () => vault.write(note(0), "edited mid-sync");
+    const r2 = await engine.run();
+    assert.ok(r2);
+    assert.equal(r2.deletedLocal, 11);
+    assert.equal(r2.skipped, 1);
+    assert.equal(vault.read(note(0)), "edited mid-sync");
+    const r3 = await engine.run();
+    assert.ok(r3);
+    assert.equal(r3.uploaded, 1, "the next pass uploads the edit");
+    assert.ok(drive.has(note(0)));
   });
 
   it("user chooses Keep for notes missing on the box: they are re-uploaded", async () => {

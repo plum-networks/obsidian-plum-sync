@@ -12,13 +12,29 @@ const kinds = (actions: Action[]): Record<string, string> =>
   Object.fromEntries(actions.map((a) => [a.rel, a.kind]));
 
 describe("planSync", () => {
-  it("propagates deletions against the base", () => {
+  it("deletes locally only when the local copy is exactly what was last synced", () => {
     const actions = planSync({
-      local: new Map([["here.txt", "h1"]]),
-      remote: new Map<string, RemoteFileState>([["there.txt", { hash: "h2" }]]),
-      base: { "here.txt": { hash: "h1" }, "there.txt": { hash: "h2" } },
+      local: new Map([
+        ["same.txt", "h1"],
+        ["edited.txt", "h2-new"],
+      ]),
+      remote: new Map(),
+      base: { "same.txt": { hash: "h1" }, "edited.txt": { hash: "h2" } },
     });
-    assert.deepEqual(kinds(actions), { "here.txt": "delLocal", "there.txt": "delRemote" });
+    // DS-07: an edit beats a delete — the edited file is re-uploaded.
+    assert.deepEqual(kinds(actions), { "same.txt": "delLocal", "edited.txt": "upload" });
+  });
+
+  it("deletes on the box only when the box copy is exactly what was last synced", () => {
+    const actions = planSync({
+      local: new Map(),
+      remote: new Map<string, RemoteFileState>([
+        ["same.txt", { hash: "h1" }],
+        ["edited.txt", { hash: "h2-new" }],
+      ]),
+      base: { "same.txt": { hash: "h1" }, "edited.txt": { hash: "h2" } },
+    });
+    assert.deepEqual(kinds(actions), { "same.txt": "delRemote", "edited.txt": "download" });
   });
 
   it("treats remote: true (peer-held) entries as present — never a local deletion", () => {

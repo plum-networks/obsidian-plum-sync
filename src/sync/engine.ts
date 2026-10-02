@@ -24,6 +24,8 @@ export interface SyncResult {
   deletedRemote: number;
   conflicts: number;
   errors: number;
+  /** Paths left alone this pass: unreadable, or edited while it ran. */
+  skipped: number;
   /**
    * Deletions withheld by the mass-deletion guard, waiting for the user:
    * `local` would delete notes in this vault (missing on the box),
@@ -102,7 +104,7 @@ export class SyncEngine {
    * re-checks everything first.
    *
    * - "delete": the next pass may delete exactly these paths — and only if it
-   *   still plans to.
+   *   still plans to (a file edited since is kept).
    * - "keep": their base entries are dropped, so the side that still has the
    *   file wins: missing on the box → re-uploaded, missing here → re-downloaded.
    *   Nothing is deleted.
@@ -170,6 +172,7 @@ export class SyncEngine {
       deletedRemote: 0,
       conflicts: 0,
       errors: 0,
+      skipped: 0,
       held: { local: [], remote: [] },
     };
     const vault = this.plugin.app.vault;
@@ -178,10 +181,13 @@ export class SyncEngine {
 
     // 1) enumerate both sides. The listing throws on any failed or incomplete
     //    answer (503 listing_incomplete, pages that don't add up) — nothing
-    //    below runs on a partial view of the box.
+    //    below runs on a partial view of the box. TFile objects are live (stat
+    //    updates in place), so remember each note's mtime as it was seen.
     const localFiles = new Map<string, TFile>();
+    const seenMtime = new Map<string, number>();
     for (const f of vault.getFiles()) {
       localFiles.set(f.path, f);
+      seenMtime.set(f.path, f.stat.mtime);
     }
     const entries = await listRemoteTree(client.drive, root);
     const remote = new Map<string, RemoteEntry>();
@@ -197,7 +203,7 @@ export class SyncEngine {
     const localHash = new Map<string, string>();
     for (const [rel, f] of localFiles) {
       const snap = base[rel];
-      if (snap && snap.mtime === f.stat.mtime) {
+      if (snap && snap.mtime === seenMtime.get(rel)) {
         localHash.set(rel, snap.hash);
       } else {
         const buf = await vault.adapter.readBinary(f.path);
@@ -220,8 +226,9 @@ export class SyncEngine {
     // 4) execute
     await pool(guarded.run, 4, async (a) => {
       try {
-        await this.exec(a, client, root, localHash, localFiles);
-        this.tally(res, a.kind);
+        const done = await this.exec(a, client, root, localHash, seenMtime);
+        if (done) this.tally(res, a.kind);
+        else res.skipped++;
       } catch (e) {
         res.errors++;
         console.error(`plum-sync: ${a.kind} ${a.rel} failed`, e);
@@ -248,19 +255,20 @@ export class SyncEngine {
     else if (kind === "conflict") res.conflicts++;
   }
 
+  /** Returns false when the action was deliberately not carried out. */
   private async exec(
     a: Action,
     client: PlumClient,
     root: string,
     localHash: Map<string, string>,
-    localFiles: Map<string, TFile>,
-  ): Promise<void> {
+    seenMtime: Map<string, number>,
+  ): Promise<boolean> {
     const base = this.plugin.settings.base;
     const remotePath = remotePathFor(root, a.rel);
     const vault = this.plugin.app.vault;
 
     if (a.kind === "adopt") {
-      base[a.rel] = { hash: localHash.get(a.rel)!, mtime: localFiles.get(a.rel)?.stat.mtime ?? Date.now() };
+      base[a.rel] = { hash: localHash.get(a.rel)!, mtime: seenMtime.get(a.rel) ?? Date.now() };
     } else if (a.kind === "forget") {
       delete base[a.rel];
     } else if (a.kind === "upload") {
@@ -275,7 +283,13 @@ export class SyncEngine {
       base[a.rel] = { hash: await sha256Hex(buf), mtime: (await this.mtime(a.rel)) ?? Date.now() };
     } else if (a.kind === "delLocal") {
       const f = vault.getAbstractFileByPath(a.rel);
-      if (f instanceof TFile) await vault.trash(f, false); // → vault .trash, recoverable
+      if (f instanceof TFile) {
+        // DS-07: the note may have been edited since it was hashed. An edit
+        // beats a delete — leave it; the next pass uploads it.
+        const seen = seenMtime.get(a.rel);
+        if (seen !== undefined && f.stat.mtime !== seen) return false;
+        await vault.trash(f, false); // → vault .trash, recoverable
+      }
       delete base[a.rel];
     } else if (a.kind === "delRemote") {
       await client.drive.remove(remotePath); // → box trash, recoverable
@@ -294,6 +308,7 @@ export class SyncEngine {
       base[a.rel] = { hash: localHash.get(a.rel)!, mtime: (await this.mtime(a.rel)) ?? Date.now() };
       new Notice(`Plum: conflict on "${a.rel}" — kept both copies.`);
     }
+    return true;
   }
 
   private async writeLocal(rel: string, buf: ArrayBuffer): Promise<void> {
@@ -330,6 +345,7 @@ export class SyncEngine {
     if (r.deletedLocal) parts.push(`🗑local ${r.deletedLocal}`);
     if (r.conflicts) parts.push(`⚠${r.conflicts} conflict`);
     if (r.errors) parts.push(`✗${r.errors} error`);
+    if (r.skipped) parts.push(`${r.skipped} skipped`);
     const held = r.held.local.length + r.held.remote.length;
     if (held) parts.push(`⏸${held} deletions paused`);
     new Notice(`Plum sync: ${parts.length ? parts.join("  ") : "already up to date"}`);
