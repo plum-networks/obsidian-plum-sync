@@ -144,14 +144,16 @@ export default class PlumSyncPlugin extends Plugin {
     this.registerInterval(t);
   }
 
-  /** Debounced sync after vault edits. */
+  /**
+   * Debounced sync after vault edits. An edit whose timer fires while a pass
+   * is running is not dropped: it syncs once that pass ends — the pass may
+   * have left that very note alone because it was saved mid-pass.
+   */
   private registerAutoSyncOnChange(): void {
     const bump = () => {
       if (!this.settings.syncOnChange || !isConnected(this)) return;
       if (this.changeTimer !== null) window.clearTimeout(this.changeTimer);
-      this.changeTimer = window.setTimeout(() => {
-        if (!this.engine.isRunning) void this.engine.run();
-      }, CHANGE_DEBOUNCE_MS);
+      this.changeTimer = window.setTimeout(() => this.syncWhenIdle(), CHANGE_DEBOUNCE_MS);
     };
     this.registerEvent(this.app.vault.on("modify", bump));
     this.registerEvent(this.app.vault.on("create", bump));

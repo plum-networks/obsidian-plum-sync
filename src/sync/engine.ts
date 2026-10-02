@@ -1,6 +1,7 @@
 import { Notice, TFile, normalizePath } from "obsidian";
 import type { PlumClient } from "@plumbox/client";
 import type PlumSyncPlugin from "../main.js";
+import type { FileSnapshot } from "../types.js";
 import { buildClient } from "../plum.js";
 import { sha256Hex, pool } from "./hash.js";
 import {
@@ -334,14 +335,18 @@ export class SyncEngine {
     } else if (a.kind === "forget") {
       delete base[a.rel];
     } else if (a.kind === "upload") {
-      const buf = await vault.adapter.readBinary(a.rel);
+      const sent = await this.readForUpload(a.rel);
       const dir = parentOf(remotePath);
       if (dir) await client.drive.ensureDir(dir);
-      await client.drive.upload(remotePath, buf, { overwrite: true });
-      base[a.rel] = { hash: localHash.get(a.rel)!, mtime: (await this.mtime(a.rel)) ?? Date.now() };
+      await client.drive.upload(remotePath, sent.buf, { overwrite: true });
+      base[a.rel] = sent.snapshot;
     } else if (a.kind === "download") {
       const buf = await client.drive.download(remotePath);
-      await this.writeLocal(a.rel, buf);
+      // R3-MOB-003: the note may have been saved (or created) while the
+      // download was in flight. Never overwrite that — leave it; the next pass
+      // sees both sides changed and keeps both copies.
+      const wrote = await this.writeLocal(a.rel, buf, () => this.asScanned(a.rel, seenMtime.get(a.rel)));
+      if (!wrote) return false;
       base[a.rel] = { hash: await sha256Hex(buf), mtime: (await this.mtime(a.rel)) ?? Date.now() };
     } else if (a.kind === "delLocal") {
       const f = vault.getAbstractFileByPath(a.rel);
@@ -365,18 +370,53 @@ export class SyncEngine {
       await this.writeLocal(cRel, remoteBuf);
       base[cRel] = { hash: await sha256Hex(remoteBuf), mtime: (await this.mtime(cRel)) ?? Date.now() };
 
-      const localBuf = await vault.adapter.readBinary(a.rel);
-      await client.drive.upload(remotePath, localBuf, { overwrite: true });
-      base[a.rel] = { hash: localHash.get(a.rel)!, mtime: (await this.mtime(a.rel)) ?? Date.now() };
+      const sent = await this.readForUpload(a.rel);
+      await client.drive.upload(remotePath, sent.buf, { overwrite: true });
+      base[a.rel] = sent.snapshot;
       new Notice(`Plum: conflict on "${a.rel}" — kept both copies.`);
     }
     return true;
   }
 
-  private async writeLocal(rel: string, buf: ArrayBuffer): Promise<void> {
+  /**
+   * Write `buf` to `rel`. With `stillAsScanned`, it is asked after the folders
+   * exist and right before the write; false → nothing is written.
+   */
+  private async writeLocal(
+    rel: string,
+    buf: ArrayBuffer,
+    stillAsScanned?: () => Promise<boolean>,
+  ): Promise<boolean> {
     const dir = parentOf(rel);
     if (dir) await this.ensureLocalDir(dir);
+    if (stillAsScanned && !(await stillAsScanned())) return false;
     await this.plugin.app.vault.adapter.writeBinary(rel, buf);
+    return true;
+  }
+
+  /**
+   * True when `rel` is still what the scan saw: the same mtime (Obsidian's
+   * TFile stat is live), or — `seen` undefined — still nothing at all.
+   */
+  private async asScanned(rel: string, seen: number | undefined): Promise<boolean> {
+    const vault = this.plugin.app.vault;
+    const f = vault.getAbstractFileByPath(rel);
+    if (seen === undefined) return f === null && !(await vault.adapter.exists(rel));
+    return f instanceof TFile && f.stat.mtime === seen;
+  }
+
+  /**
+   * Read a note for upload, with the base entry it earns once uploaded: the
+   * hash of exactly these bytes and the mtime from BEFORE reading them. A save
+   * that lands while the upload is in flight then has a newer mtime than the
+   * base, so the next pass re-hashes and uploads it. (Taking the mtime after
+   * the upload paired the new mtime with the old hash, and the save was never
+   * synced — until a box edit overwrote it.)
+   */
+  private async readForUpload(rel: string): Promise<{ buf: ArrayBuffer; snapshot: FileSnapshot }> {
+    const mtime = (await this.mtime(rel)) ?? 0;
+    const buf = await this.plugin.app.vault.adapter.readBinary(rel);
+    return { buf, snapshot: { hash: await sha256Hex(buf), mtime } };
   }
 
   private async ensureLocalDir(dir: string): Promise<void> {

@@ -26,6 +26,9 @@ is known to be complete and the surviving copy is exactly what was last synced.
   re-download). Everything else still syncs. Closing the dialog keeps them
   paused; run **Plum Box Sync: Review paused deletions** to decide later.
 - **Edit vs delete**: an edit always wins; the edited copy is synced back.
+- **Saved during a sync**: a note saved (or created) while its download is in
+  flight is not overwritten — the next sync keeps both copies. A save made
+  while its upload is in flight is uploaded by the next sync.
 - **Hidden files** (`.obsidian/`, anything starting with `.`) and notes that
   cannot be read are left alone, never treated as deleted. The first sync waits
   until Obsidian has finished loading the vault.
