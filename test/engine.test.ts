@@ -11,7 +11,7 @@ import {
   type ListOptions,
 } from "@plumbox/client";
 import type PlumSyncPlugin from "../src/main.js";
-import { SyncEngine } from "../src/sync/engine.js";
+import { SyncEngine, syncTargetKey } from "../src/sync/engine.js";
 import { DEFAULT_SETTINGS, type PlumSyncSettings } from "../src/types.js";
 
 const ROOT = "/Obsidian/Vault";
@@ -409,5 +409,37 @@ describe("SyncEngine: things the vault cannot see are not deletions (DS-04)", ()
     assert.equal(r.skipped, 1);
     assert.deepEqual(drive.removed, []);
     assert.equal(dec(drive.files.get(`${ROOT}/${note(1)}`)!.data), "note 1");
+  });
+});
+
+describe("SyncEngine: base belongs to one account + remote folder (DS-02)", () => {
+  it("changing the remote folder does not delete notes", async () => {
+    const engine = engineFor();
+    await settled(engine, 5);
+    plugin.settings.remoteRoot = "/Obsidian/Elsewhere";
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.deletedLocal, 0);
+    assert.deepEqual(vault.trashed, []);
+  });
+
+  it("switching to another account does not delete notes", async () => {
+    const engine = engineFor();
+    await settled(engine, 5);
+    plugin.settings.account = "someone-else@example.com";
+    drive.files.clear();
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.deletedLocal, 0);
+    assert.equal(r.uploaded, 5);
+  });
+
+  it("adopts the key on upgrade without resetting the base", async () => {
+    const engine = engineFor();
+    await settled(engine, 5);
+    plugin.settings.baseKey = "";
+    await engine.run();
+    assert.equal(Object.keys(plugin.settings.base).length, 5);
+    assert.equal(plugin.settings.baseKey, syncTargetKey(plugin.settings));
   });
 });

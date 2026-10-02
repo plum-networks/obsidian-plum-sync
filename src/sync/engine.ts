@@ -74,6 +74,18 @@ export function isHiddenRel(rel: string): boolean {
   return rel.split("/").some((seg) => seg.startsWith("."));
 }
 
+/**
+ * Identity of what a base describes: box + account + remote folder (the vault
+ * itself is implied — the plugin's data lives inside it). See `baseKey`.
+ */
+export function syncTargetKey(s: { baseUrl: string; account: string; remoteRoot: string }): string {
+  return JSON.stringify([
+    (s.baseUrl || "").trim().replace(/\/+$/, "").toLowerCase(),
+    (s.account || "").trim().toLowerCase(),
+    "/" + trimSlashes(s.remoteRoot || ""),
+  ]);
+}
+
 type PerSide<T> = { local: T; remote: T };
 const emptySets = (): PerSide<Set<string>> => ({ local: new Set(), remote: new Set() });
 
@@ -174,6 +186,7 @@ export class SyncEngine {
     const settings = this.plugin.settings;
     const root = settings.remoteRoot || this.defaultRoot();
     settings.remoteRoot = root;
+    this.bindBase();
 
     const res: SyncResult = {
       uploaded: 0,
@@ -268,6 +281,25 @@ export class SyncEngine {
     settings.lastSync = Date.now();
     await this.plugin.saveSettings();
     return res;
+  }
+
+  /**
+   * DS-02: a base is only valid for the account + remote folder it was
+   * recorded against. When either changed, start from an empty base: that
+   * pass can only upload, download or keep both — it cannot delete.
+   */
+  private bindBase(): void {
+    const settings = this.plugin.settings;
+    const key = syncTargetKey(settings);
+    if (settings.baseKey === key) return;
+    if (settings.baseKey && Object.keys(settings.base).length) {
+      console.info("plum-sync: account or remote folder changed — starting from a fresh base");
+      settings.base = {};
+    }
+    settings.baseKey = key;
+    this.held = { local: [], remote: [] };
+    this.approved = emptySets();
+    this.keep = emptySets();
   }
 
   private applyKeep(base: Record<string, unknown>): void {

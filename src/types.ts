@@ -29,6 +29,13 @@ export interface PlumSyncSettings {
 
   /** 3-way sync base: path → snapshot at last successful sync. */
   base: Record<string, FileSnapshot>;
+  /**
+   * Which box account + remote folder `base` describes. A base only means
+   * something for the pair it was recorded against: reused after either
+   * changes, every note missing from the new folder looks "deleted on the
+   * box" and gets deleted here. Empty = not recorded yet.
+   */
+  baseKey: string;
   /** Last successful sync (ms epoch); 0 if never. */
   lastSync: number;
 
@@ -44,6 +51,7 @@ export const DEFAULT_SETTINGS: PlumSyncSettings = {
   syncIntervalMin: 15,
   syncOnChange: true,
   base: {},
+  baseKey: "",
   lastSync: 0,
   pending: null,
 };
