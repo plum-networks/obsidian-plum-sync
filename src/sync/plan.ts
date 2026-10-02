@@ -36,6 +36,12 @@ export interface PlanInput {
   remote: ReadonlyMap<string, RemoteFileState>;
   /** Last-sync base: rel → hash both sides agreed on. */
   base: Readonly<Record<string, { hash: string }>>;
+  /**
+   * Paths whose state is unknown this pass (unreadable local folder, a box
+   * folder whose contents are not listed). They get no action at all: absent
+   * from a listing we could not fully read is not "deleted".
+   */
+  skip?: (rel: string) => boolean;
 }
 
 /**
@@ -47,10 +53,12 @@ export interface PlanInput {
  */
 export function planSync(input: PlanInput): Action[] {
   const { local, remote, base } = input;
+  const skip = input.skip ?? (() => false);
   const out: Action[] = [];
   const rels = new Set<string>([...local.keys(), ...remote.keys(), ...Object.keys(base)]);
 
   for (const rel of rels) {
+    if (skip(rel)) continue;
     const lh = local.get(rel);
     const r = remote.get(rel);
     const L = lh !== undefined;
@@ -170,4 +178,10 @@ export function guardDeletions(
     ? actions.filter((a) => !holdKeys.has(`${a.kind}\0${a.rel}`))
     : actions;
   return { run, held, limit };
+}
+
+/** True when `rel` is `prefix` itself or lies underneath it. */
+export function isUnder(rel: string, prefix: string): boolean {
+  if (prefix === "") return true;
+  return rel === prefix || rel.startsWith(prefix + "/");
 }

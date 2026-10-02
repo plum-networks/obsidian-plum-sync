@@ -385,3 +385,29 @@ describe("SyncEngine: mass-deletion guard", () => {
     assert.equal(r2.deletedRemote, 30);
   });
 });
+
+describe("SyncEngine: things the vault cannot see are not deletions (DS-04)", () => {
+  it("never deletes or downloads hidden box files", async () => {
+    const engine = engineFor();
+    drive.put(".obsidian/app.json", "{}");
+    drive.put("sub/.git/config", "x");
+    drive.put("a.md", "a");
+    await engine.run();
+    await engine.run();
+    assert.deepEqual(drive.removed, []);
+    assert.equal(vault.has(".obsidian/app.json"), false);
+    assert.ok(vault.has("a.md"));
+  });
+
+  it("leaves an unreadable note alone instead of deleting it on the box", async () => {
+    const engine = engineFor();
+    await settled(engine, 3);
+    vault.write(note(1), "changed, so it must be re-read");
+    vault.failRead.add(note(1));
+    const r = await engine.run();
+    assert.ok(r);
+    assert.equal(r.skipped, 1);
+    assert.deepEqual(drive.removed, []);
+    assert.equal(dec(drive.files.get(`${ROOT}/${note(1)}`)!.data), "note 1");
+  });
+});

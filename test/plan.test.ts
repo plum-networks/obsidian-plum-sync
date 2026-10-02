@@ -57,6 +57,16 @@ describe("planSync", () => {
     assert.ok(!actions.some((a) => a.kind === "delLocal"));
   });
 
+  it("gives skipped (unreadable / unlisted) paths no action at all", () => {
+    const actions = planSync({
+      local: new Map(),
+      remote: new Map<string, RemoteFileState>([["locked/a.txt", { hash: "h1" }]]),
+      base: { "locked/a.txt": { hash: "h1" }, "locked/b.txt": { hash: "h2" } },
+      skip: (rel) => rel.startsWith("locked/"),
+    });
+    assert.deepEqual(actions, []);
+  });
+
   it("adopts identical files with no base and forgets files gone on both sides", () => {
     const actions = planSync({
       local: new Map([["a.txt", "h1"]]),

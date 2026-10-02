@@ -5,6 +5,7 @@ import { buildClient } from "../plum.js";
 import { sha256Hex, pool } from "./hash.js";
 import {
   guardDeletions,
+  isUnder,
   planSync,
   type Action,
   type ActionKind,
@@ -62,6 +63,15 @@ function conflictName(rel: string): string {
   const base = dot > rel.lastIndexOf("/") ? rel.slice(0, dot) : rel;
   const ext = dot > rel.lastIndexOf("/") ? rel.slice(dot) : "";
   return `${base} (conflict ${stamp})${ext}`;
+}
+
+/**
+ * Obsidian does not index dot-files/folders (.obsidian, .trash, .git), so the
+ * vault can never "see" them. A box file under such a path would be downloaded
+ * and then look deleted on the next pass — so both sides skip them.
+ */
+export function isHiddenRel(rel: string): boolean {
+  return rel.split("/").some((seg) => seg.startsWith("."));
 }
 
 type PerSide<T> = { local: T; remote: T };
@@ -176,6 +186,8 @@ export class SyncEngine {
       held: { local: [], remote: [] },
     };
     const vault = this.plugin.app.vault;
+    const configDir = vault.configDir || ".obsidian";
+    const ignored = (rel: string): boolean => isHiddenRel(rel) || isUnder(rel, configDir);
 
     await client.drive.ensureDir(root);
 
@@ -186,18 +198,25 @@ export class SyncEngine {
     const localFiles = new Map<string, TFile>();
     const seenMtime = new Map<string, number>();
     for (const f of vault.getFiles()) {
+      if (ignored(f.path)) continue;
       localFiles.set(f.path, f);
       seenMtime.set(f.path, f.stat.mtime);
     }
     const entries = await listRemoteTree(client.drive, root);
+    const opaque: string[] = []; // paths whose contents we cannot see this pass
     const remote = new Map<string, RemoteEntry>();
     for (const e of entries) {
-      if (e.isDir) continue;
       const rel = relFromRemote(root, e.path);
-      if (rel) remote.set(rel, e); // `remote: true` (peer-held) is present like any file
+      if (!rel || ignored(rel)) continue;
+      if (e.isDir) {
+        if (e.secret) opaque.push(rel); // locked folder: contents never listed
+        continue;
+      }
+      remote.set(rel, e); // `remote: true` (peer-held) is present like any file
     }
 
-    // 2) local hashes (reuse the base snapshot when mtime is unchanged)
+    // 2) local hashes (reuse the base snapshot when mtime is unchanged). A note
+    //    that cannot be read is left alone, not treated as deleted.
     const base = settings.base;
     this.applyKeep(base);
     const localHash = new Map<string, string>();
@@ -205,14 +224,25 @@ export class SyncEngine {
       const snap = base[rel];
       if (snap && snap.mtime === seenMtime.get(rel)) {
         localHash.set(rel, snap.hash);
-      } else {
+        continue;
+      }
+      try {
         const buf = await vault.adapter.readBinary(f.path);
         localHash.set(rel, await sha256Hex(buf));
+      } catch (e) {
+        console.error(`plum-sync: could not read ${rel}; leaving it alone this pass`, e);
+        opaque.push(rel);
       }
     }
+    res.skipped = opaque.length;
 
     // 3) 3-way classification + mass-deletion guard
-    const planned = planSync({ local: localHash, remote, base });
+    const planned = planSync({
+      local: localHash,
+      remote,
+      base,
+      skip: (rel) => ignored(rel) || opaque.some((p) => isUnder(rel, p)),
+    });
     const guarded = guardDeletions(
       planned,
       Object.keys(base).length,

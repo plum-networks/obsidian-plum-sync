@@ -58,13 +58,18 @@ export default class PlumSyncPlugin extends Plugin {
 
     this.addSettingTab(new PlumSyncSettingTab(this.app, this));
 
-    this.registerAutoSyncOnChange();
     this.rescheduleAutoSync();
 
-    // A gentle sync shortly after startup if connected.
-    if (isConnected(this)) {
-      this.registerInterval(window.setTimeout(() => void this.engine.run(), 4000));
-    }
+    // Wait until Obsidian has finished indexing the vault: before that,
+    // getFiles() is incomplete and every note not yet indexed would look
+    // deleted. (The vault also fires "create" for every file while loading.)
+    this.app.workspace.onLayoutReady(() => {
+      this.registerAutoSyncOnChange();
+      // A gentle sync shortly after startup if connected.
+      if (isConnected(this)) {
+        this.registerInterval(window.setTimeout(() => void this.engine.run(), 4000));
+      }
+    });
   }
 
   onunload(): void {
