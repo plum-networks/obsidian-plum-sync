@@ -35,6 +35,13 @@ var PlumAuthError = class extends PlumApiError {
     this.name = "PlumAuthError";
   }
 };
+var PlumOAuthError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "PlumOAuthError";
+    this.code = code;
+  }
+};
 function errorFromResponse(status, bodyText) {
   let message = bodyText.trim();
   let code;
@@ -306,6 +313,66 @@ var DriveApi = class {
   }
 };
 
+// src/apps.ts
+var AppsApi = class {
+  constructor(client) {
+    this.client = client;
+  }
+  /**
+   * GET /api/apps/{appId}/status — the runtime state of the app's box-side
+   * service. Throws a PlumApiError with status 404 when the app is not
+   * installed for this user (or has no service).
+   */
+  async status(appId) {
+    const res = await this.client.request(`/api/apps/${encodeURIComponent(appId)}/status`);
+    return responseJSON(res);
+  }
+  /**
+   * Check that the app's service is installed on the box; if it is not,
+   * return the links that take the user to install it: `installUrl` opens
+   * the Plum app on the store page (`plum://store/<appId>`), `webUrl` opens
+   * the box's own web UI for a device without the Plum app. Installation is
+   * confirmed by the owner there; afterwards the Plum app returns to your
+   * registered redirect URI.
+   */
+  async ensureServiceInstalled(appId) {
+    try {
+      const status = await this.status(appId);
+      return { installed: true, status };
+    } catch (err) {
+      if (err instanceof PlumApiError && err.status === 404) {
+        const id = encodeURIComponent(appId);
+        return {
+          installed: false,
+          installUrl: `plum://store/${id}`,
+          webUrl: `${this.client.baseUrl}/#/store/${id}?install=1`
+        };
+      }
+      throw err;
+    }
+  }
+  /**
+   * GET /api/apps/{appId}/entitlement — the store receipts this box holds for
+   * the app, as the box verified them. Works before the service is
+   * installed. Needs a session or a token with `service:call:<appId>` (or a
+   * read scope). What a SKU unlocks is up to your app; the box only proves
+   * the receipt.
+   */
+  async entitlement(appId) {
+    const res = await this.client.request(`/api/apps/${encodeURIComponent(appId)}/entitlement`);
+    return responseJSON(res);
+  }
+  /**
+   * POST /api/apps/entitlements/refresh — ask the box to fetch its receipts
+   * from the store now (right after a purchase). Returns how many receipts
+   * the box now holds.
+   */
+  async refreshEntitlements() {
+    const res = await this.client.request(`/api/apps/entitlements/refresh`, { method: "POST" });
+    return responseJSON(res).receipts;
+  }
+};
+
 // src/client.ts
 var TOKEN_STORAGE_KEY = "plumbox.token";
 var PlumClient = class {
@@ -318,6 +385,7 @@ var PlumClient = class {
     this.onAuthError = opts.onAuthError;
     this.drive = new DriveApi(this);
     this.auth = new AuthApi(this);
+    this.apps = new AppsApi(this);
   }
   /** Load a previously stored PAT from tokenStorage. Returns true when found. */
   async loadToken() {
@@ -345,6 +413,12 @@ var PlumClient = class {
    * First-factor login with the box account's email/username + password.
    * On success the client holds a session cookie (7-day TTL) — immediately
    * mint a PAT with `auth.createToken` and persist only that.
+   *
+   * @deprecated Connect with delegated OAuth instead (`beginAuthorization` →
+   * `parseCallback` → `exchangeCode`), so the password is typed only on the
+   * box's own page. A Plum Box v3 box can answer a sign-in from a new device
+   * with a mail code (`requireSecondFactor`); this method cannot complete that
+   * step and stops with `PlumApiError` code `second_factor_unsupported`.
    */
   async login(cred) {
     const res = await this.request("/api/auth/login", {
@@ -353,6 +427,13 @@ var PlumClient = class {
       allowStatus: [200]
     });
     const body = responseJSON(res);
+    if (body.requireSecondFactor) {
+      throw new PlumApiError(
+        res.status,
+        "this box asks a new device for a mail code, which PlumClient.login cannot answer \u2014 connect with delegated OAuth (beginAuthorization)",
+        "second_factor_unsupported"
+      );
+    }
     if (body.requireTotp && body.tempToken) {
       const tempToken = body.tempToken;
       return {
@@ -470,10 +551,53 @@ async function discover(email, opts) {
 
 // src/oauth.ts
 var DEFAULT_PORTAL_URL = "https://plumbox.me";
+var PLUM_ISSUER_PATTERN = /^https:\/\/pb-[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?\.plumbox\.me$/;
+function isPlumIssuer(iss) {
+  return typeof iss === "string" && PLUM_ISSUER_PATTERN.test(iss) && !iss.endsWith("-lan.plumbox.me") && !iss.endsWith("-wan.plumbox.me");
+}
 function parseCallback(callbackUrl) {
   const u = new URL(callbackUrl);
-  const g = (k) => u.searchParams.get(k) ?? void 0;
-  return { code: g("code"), state: g("state"), iss: g("iss"), error: g("error") };
+  return checkCallback((k) => u.searchParams.getAll(k));
+}
+function callbackFromParams(params) {
+  return checkCallback((k) => {
+    const v = params[k];
+    if (v === void 0 || v === null) return [];
+    return Array.isArray(v) ? v.map(String) : [String(v)];
+  });
+}
+function checkCallback(all) {
+  const one = (k) => {
+    const v = all(k);
+    if (v.length > 1) return null;
+    return v.length === 1 && v[0] !== "" ? v[0] : void 0;
+  };
+  const code = one("code");
+  const state = one("state");
+  const iss = one("iss");
+  const error = one("error");
+  const out = {};
+  if (typeof state === "string") out.state = state;
+  if (iss === null || iss !== void 0 && !isPlumIssuer(iss)) {
+    out.error = "invalid_iss";
+    return out;
+  }
+  if (error !== void 0 || code === null) {
+    out.error = typeof error === "string" ? error : "invalid_request";
+    if (iss) out.iss = iss;
+    return out;
+  }
+  if (code === void 0) {
+    out.error = "invalid_request";
+    return out;
+  }
+  if (!iss) {
+    out.error = "invalid_iss";
+    return out;
+  }
+  out.code = code;
+  out.iss = iss;
+  return out;
 }
 var b64url = (bytes) => {
   let s = "";
@@ -503,26 +627,49 @@ async function sha256(bytes) {
   return new Uint8Array(await subtle.digest("SHA-256", bytes));
 }
 async function beginAuthorization(opts) {
+  const clientId = (opts.clientId ?? "").trim();
+  if (!clientId) {
+    throw new Error("beginAuthorization: clientId is required (register one in the Plum developer console)");
+  }
+  if (!opts.scopes || opts.scopes.length === 0) {
+    throw new Error("beginAuthorization: at least one scope is required");
+  }
   const portal = (opts.portalUrl ?? DEFAULT_PORTAL_URL).replace(/\/+$/, "");
   const codeVerifier = b64url(randomBytes(32));
   const codeChallenge = b64url(await sha256(new TextEncoder().encode(codeVerifier)));
   const state = b64url(randomBytes(16));
   const params = new URLSearchParams({
     response_type: "code",
-    client_id: opts.clientId,
-    client_name: opts.clientName,
+    client_id: clientId,
     redirect_uri: opts.redirectUri,
     scope: opts.scopes.join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     state
   });
+  if (opts.clientName) params.set("client_name", opts.clientName);
   return { url: `${portal}/authorize?${params}`, codeVerifier, state };
 }
 async function exchangeCode(opts) {
+  const iss = opts.baseUrl;
+  if (!isPlumIssuer(iss)) {
+    throw new PlumOAuthError(
+      "invalid_iss",
+      "exchangeCode: the callback's iss is not a Plum box (https://pb-\u2026.plumbox.me); nothing was sent"
+    );
+  }
+  if (typeof opts.expectedState !== "string" || opts.expectedState === "" || opts.state !== opts.expectedState) {
+    throw new PlumOAuthError(
+      "invalid_state",
+      "exchangeCode: the callback's state is not the one this sign-in began with; nothing was sent"
+    );
+  }
+  if (!opts.code || !opts.codeVerifier) {
+    throw new PlumOAuthError("invalid_request", "exchangeCode: code and codeVerifier are required");
+  }
   const http = opts.http ?? fetchAdapter;
   const res = await http.request({
-    url: opts.baseUrl.replace(/\/+$/, "") + "/api/oauth/token",
+    url: iss + "/api/oauth/token",
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -565,16 +712,22 @@ function injectedAdapter(requestUrl) {
   };
 }
 export {
+  AppsApi,
+  AuthApi,
   DEFAULT_PORTAL_URL,
   DEFAULT_RELAY_URL,
   DriveApi,
+  PLUM_ISSUER_PATTERN,
   PlumApiError,
   PlumAuthError,
   PlumClient,
+  PlumOAuthError,
   beginAuthorization,
+  callbackFromParams,
   discover,
   exchangeCode,
   fetchAdapter,
   injectedAdapter,
+  isPlumIssuer,
   parseCallback
 };

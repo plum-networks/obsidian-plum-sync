@@ -1,12 +1,30 @@
 {
   "name": "@plumbox/client",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Client SDK for Plum Box: log in once, auto-connect to the user's box via Plum Relay, and use the Drive API — no IP, port, or tunneling knowledge required.",
   "license": "MIT",
+  "keywords": [
+    "plum",
+    "plumbox",
+    "plum-box",
+    "sdk",
+    "client",
+    "drive",
+    "self-hosted",
+    "oauth",
+    "pkce"
+  ],
+  "homepage": "https://github.com/plum-networks/plum-sdk/tree/main/packages/client#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/plum-networks/plum-sdk",
+    "url": "git+https://github.com/plum-networks/plum-sdk.git",
     "directory": "packages/client"
+  },
+  "bugs": {
+    "url": "https://github.com/plum-networks/plum-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "type": "module",
   "main": "./dist/index.cjs",
@@ -17,7 +35,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
@@ -26,6 +45,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:integration": "PLUM_INTEGRATION=1 vitest run test/integration.test.ts"
   },

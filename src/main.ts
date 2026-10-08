@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS, type PlumSyncSettings } from "./types.js";
 import { PlumSyncSettingTab } from "./settings-tab.js";
 import { SyncEngine } from "./sync/engine.js";
 import { completeConnect, isConnected } from "./plum.js";
-import { parseCallback } from "@plumbox/client";
+import { forgetUncheckedBox } from "./connect.js";
 
 const CHANGE_DEBOUNCE_MS = 8000;
 
@@ -18,12 +18,9 @@ export default class PlumSyncPlugin extends Plugin {
     await this.loadSettings();
     this.engine = new SyncEngine(this);
 
-    // Deep link back from the plumbox.me sign-in: obsidian://plum-sync?code=&iss=&state=
+    // Deep link back from the box after sign-in: obsidian://plum-sync?code=&iss=&state=
     this.registerObsidianProtocolHandler("plum-sync", async (params: ObsidianProtocolData) => {
-      const cb = parseCallback(
-        "obsidian://plum-sync?" + new URLSearchParams(params as Record<string, string>).toString(),
-      );
-      const ok = await completeConnect(this, cb);
+      const ok = await completeConnect(this, params);
       if (ok && this.settings.syncOnChange) void this.engine.run();
     });
 
@@ -59,6 +56,8 @@ export default class PlumSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     // Never carry a half-finished OAuth request across reloads.
     this.settings.pending = this.settings.pending ?? null;
+    // A connection 0.1 saved from an unchecked iss is dropped: reconnect.
+    if (forgetUncheckedBox(this.settings)) await this.saveSettings();
   }
 
   async saveSettings(): Promise<void> {

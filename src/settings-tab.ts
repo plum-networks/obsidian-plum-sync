@@ -36,7 +36,7 @@ export class PlumSyncSettingTab extends PluginSettingTab {
       );
     } else {
       status.setDesc(
-        "You'll sign in on plumbox.me in your browser. This plugin never sees your password — only a scoped token you can revoke.",
+        "Your browser opens plumbox.me to find your Plum Box, and you type your password only on your box's own page. This plugin never sees it — it gets access to your files that you can take back in your box settings.",
       );
       status.addButton((b) =>
         b
