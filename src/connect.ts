@@ -7,6 +7,7 @@ import {
   isPlumIssuer,
   PlumOAuthError,
   type HttpAdapter,
+  type OAuthTokens,
 } from "@plumbox/client";
 import { CLIENT_ID, CLIENT_NAME, REDIRECT_URI, SCOPES, type PlumSyncSettings } from "./types.js";
 
@@ -28,16 +29,18 @@ export async function beginConnect(): Promise<{ url: string; pending: PendingSig
 }
 
 export type ConnectOutcome =
-  | { kind: "connected"; baseUrl: string; token: string }
+  /** `iss`: the checked box. `tokens`: everything the box returned — keep it all. */
+  | { kind: "connected"; iss: string; tokens: OAuthTokens }
   | {
       kind: "stopped";
       /**
        * no_pending: no sign-in was started here. cancelled: the box said no,
-       * or the user did. invalid_iss: the link did not come from a Plum box.
-       * invalid_state: it is not the sign-in this plugin started. failed: the
-       * box refused the exchange or could not be reached.
+       * or the user did. invalid_scope: the box does not know a scope we ask
+       * for (files:app came with a box update). invalid_iss: the link did not
+       * come from a Plum box. invalid_state: it is not the sign-in this plugin
+       * started. failed: the box refused the exchange or could not be reached.
        */
-      reason: "no_pending" | "cancelled" | "invalid_iss" | "invalid_state" | "failed";
+      reason: "no_pending" | "cancelled" | "invalid_scope" | "invalid_iss" | "invalid_state" | "failed";
       detail?: string;
     };
 
@@ -55,9 +58,10 @@ export async function finishConnect(
   if (!pending) return { kind: "stopped", reason: "no_pending" };
   const cb = callbackFromParams(params);
   if (cb.error === "invalid_iss") return { kind: "stopped", reason: "invalid_iss" };
+  if (cb.error === "invalid_scope") return { kind: "stopped", reason: "invalid_scope" };
   if (cb.error || !cb.code || !cb.iss) return { kind: "stopped", reason: "cancelled", detail: cb.error };
   try {
-    const { accessToken } = await exchangeCode({
+    const tokens = await exchangeCode({
       baseUrl: cb.iss,
       code: cb.code,
       state: cb.state,
@@ -67,7 +71,7 @@ export async function finishConnect(
       redirectUri: REDIRECT_URI,
       http,
     });
-    return { kind: "connected", baseUrl: cb.iss, token: accessToken };
+    return { kind: "connected", iss: cb.iss, tokens };
   } catch (e) {
     if (e instanceof PlumOAuthError && (e.code === "invalid_iss" || e.code === "invalid_state")) {
       return { kind: "stopped", reason: e.code };
@@ -77,9 +81,9 @@ export async function finishConnect(
 }
 
 /**
- * Drop a stored connection whose box address is not a Plum box's own address.
- * Version 0.1 stored whatever `iss` came back, unchecked; a token is never
- * sent to anything else. Returns true when it changed the settings.
+ * Drop a legacy data.json token whose box address is not a Plum box's own
+ * address. Version 0.1 stored whatever `iss` came back, unchecked; a token is
+ * never sent to anything else. Returns true when it changed the settings.
  */
 export function forgetUncheckedBox(settings: PlumSyncSettings): boolean {
   if (!settings.baseUrl && !settings.token) return false;

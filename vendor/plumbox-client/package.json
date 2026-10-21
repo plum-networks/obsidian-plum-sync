@@ -1,6 +1,6 @@
 {
   "name": "@plumbox/client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Client SDK for Plum Box: log in once, auto-connect to the user's box via Plum Relay, and use the Drive API — no IP, port, or tunneling knowledge required.",
   "license": "MIT",
   "keywords": [

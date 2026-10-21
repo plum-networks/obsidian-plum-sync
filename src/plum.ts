@@ -1,7 +1,11 @@
 import { requestUrl, Notice } from "obsidian";
-import { PlumClient, injectedAdapter, isPlumIssuer } from "@plumbox/client";
+import { injectedAdapter, type PlumAuthError } from "@plumbox/client";
 import { beginConnect, finishConnect } from "./connect.js";
+import { connectionFromTokens, mayReadProfile, type ActiveConnection } from "./connection.js";
 import type PlumSyncPlugin from "./main.js";
+
+/** Obsidian's requestUrl: bypasses CORS on desktop and mobile. */
+export const http = injectedAdapter(requestUrl);
 
 /**
  * Delegated ("Sign in with Plum") authorization. The password is NEVER typed in
@@ -26,8 +30,8 @@ export async function startConnect(plugin: PlumSyncPlugin): Promise<void> {
 /**
  * Handle the obsidian://plum-sync?code=&iss=&state= deep link fired after the
  * user approves on their box. The code goes only to the box a checked `iss`
- * names, and only for the sign-in started here; then {baseUrl, token} is
- * saved. Returns true on success.
+ * names, and only for the sign-in started here; the tokens are then kept as
+ * this device's connection. Returns true on success.
  */
 export async function completeConnect(
   plugin: PlumSyncPlugin,
@@ -36,7 +40,7 @@ export async function completeConnect(
   const pending = plugin.settings.pending;
   plugin.settings.pending = null; // one-shot, whatever happens
 
-  const outcome = await finishConnect(pending, params, injectedAdapter(requestUrl));
+  const outcome = await finishConnect(pending, params, http);
   if (outcome.kind === "stopped") {
     switch (outcome.reason) {
       case "no_pending":
@@ -48,6 +52,9 @@ export async function completeConnect(
       case "invalid_state":
         new Notice("Plum: this is not the sign-in you started here, so it was stopped. Try Connect again.");
         break;
+      case "invalid_scope":
+        new Notice("Plum: your box does not offer this plugin its own folder yet. Update your Plum Box, then connect again.");
+        break;
       case "cancelled":
         new Notice(`Plum: sign-in was cancelled${outcome.detail ? ` (${outcome.detail})` : ""}.`);
         break;
@@ -58,39 +65,39 @@ export async function completeConnect(
     return false;
   }
 
-  plugin.settings.baseUrl = outcome.baseUrl;
-  plugin.settings.token = outcome.token;
-  // Best-effort: record which account this is, for the settings display.
-  try {
-    const me = await buildClient(plugin)!.auth.me();
-    plugin.settings.account = me.email ?? me.username ?? "";
-  } catch {
-    /* non-fatal — the token still works for drive */
-  }
+  const conn = connectionFromTokens(outcome.iss, outcome.tokens);
+  await plugin.setConnection(conn);
   await plugin.saveSettings();
+  // Best-effort: record which account this is, for the settings display.
+  // Only when the box granted user:profile — otherwise it would answer 403.
+  if (mayReadProfile(conn)) {
+    try {
+      const me = await plugin.getClient()!.auth.me();
+      await plugin.updateAccount(conn.id, me.email ?? me.username ?? "");
+    } catch {
+      /* non-fatal — the token still works for drive */
+    }
+  }
   new Notice("Connected to your Plum Box.");
   return true;
 }
 
-/** Build a PlumClient from stored credentials, or null if not connected. */
-export function buildClient(plugin: PlumSyncPlugin): PlumClient | null {
-  const { baseUrl, token } = plugin.settings;
-  // The token goes only to a Plum box's own address (see forgetUncheckedBox).
-  if (!token || !isPlumIssuer(baseUrl)) return null;
-  return new PlumClient({
-    baseUrl,
-    token,
-    http: injectedAdapter(requestUrl),
-    onAuthError: () => {
-      // Token revoked/expired: drop it so the UI prompts a reconnect.
-      plugin.settings.token = "";
-      plugin.settings.account = "";
-      void plugin.saveSettings();
-      new Notice("Plum: access was revoked. Reconnect from settings.");
-    },
-  });
+/**
+ * The box no longer takes this connection: the refresh was refused (it was
+ * disconnected in box settings, or not used for 90 days) or a token without
+ * a refresh token was rejected. Called once per connection by the SDK —
+ * never for a 403, which only means "not allowed".
+ */
+export async function connectionEnded(plugin: PlumSyncPlugin, conn: ActiveConnection, err: PlumAuthError): Promise<void> {
+  console.warn("plum-sync: the box ended the connection", err);
+  const dropped = await plugin.dropConnection(conn);
+  if (dropped) {
+    new Notice(
+      "Plum: your box no longer accepts this device's connection (it was revoked, or not used for 90 days). Connect again in settings.",
+    );
+  }
 }
 
 export function isConnected(plugin: PlumSyncPlugin): boolean {
-  return !!plugin.settings.token && isPlumIssuer(plugin.settings.baseUrl);
+  return plugin.connection() !== null;
 }

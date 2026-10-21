@@ -18,7 +18,11 @@ if (!(globalThis as { crypto?: unknown }).crypto) {
 const BOX = "https://pb-0123456789abcdef0123456789ab7f3a.plumbox.me";
 const PENDING: PendingSignIn = { verifier: "v".repeat(43), state: "STATE-1" };
 
-function spy(status = 200, body = `{"access_token":"plum_pat_x","token_type":"bearer","scope":"files:read files:write"}`) {
+const TOKEN_REPLY =
+  `{"access_token":"plum_pat_x","token_type":"bearer","expires_in":3600,"refresh_token":"plum_rt_x",` +
+  `"scope":"files:app user:profile","app_folder":"/Apps/Obsidian Sync"}`;
+
+function spy(status = 200, body = TOKEN_REPLY) {
   const sent: { url: string; body: string }[] = [];
   const http: HttpAdapter = {
     async request(req) {
@@ -48,8 +52,8 @@ describe("client identity (D12)", () => {
     expect(label).toMatch(labelRe);
   });
 
-  it("asks for files only, never admin, at a native redirect", () => {
-    expect([...SCOPES].sort()).toEqual(["files:read", "files:write"]);
+  it("asks for its own folder and the profile, never the whole drive or admin, at a native redirect", () => {
+    expect([...SCOPES].sort()).toEqual(["files:app", "user:profile"]);
     const u = new URL(REDIRECT_URI);
     expect(u.protocol).toBe("obsidian:");
     expect(u.host).toBe("plum-sync"); // the protocol handler main.ts registers
@@ -61,7 +65,7 @@ describe("client identity (D12)", () => {
     expect(u.origin + u.pathname).toBe("https://plumbox.me/authorize");
     expect(u.searchParams.get("client_id")).toBe("im.plum.obsidian-sync:obsidian");
     expect(u.searchParams.get("redirect_uri")).toBe("obsidian://plum-sync");
-    expect(u.searchParams.get("scope")).toBe("files:read files:write");
+    expect(u.searchParams.get("scope")).toBe("files:app user:profile");
     expect(u.searchParams.get("code_challenge_method")).toBe("S256");
     expect(u.searchParams.get("state")).toBe(pending.state);
     expect(pending.verifier.length).toBeGreaterThanOrEqual(43);
@@ -69,10 +73,20 @@ describe("client identity (D12)", () => {
 });
 
 describe("finishConnect", () => {
-  it("exchanges the code at the box the link names and keeps that box", async () => {
+  it("exchanges the code at the box the link names and keeps that box and every token", async () => {
     const { sent, http } = spy();
     const out = await finishConnect(PENDING, { action: "plum-sync", code: "C1", state: "STATE-1", iss: BOX }, http);
-    expect(out).toEqual({ kind: "connected", baseUrl: BOX, token: "plum_pat_x" });
+    expect(out).toMatchObject({
+      kind: "connected",
+      iss: BOX,
+      tokens: {
+        accessToken: "plum_pat_x",
+        refreshToken: "plum_rt_x",
+        scope: "files:app user:profile",
+        appFolder: "/Apps/Obsidian Sync",
+      },
+    });
+    if (out.kind === "connected") expect(out.tokens.expiresAt).toBeGreaterThan(Date.now());
     expect(sent.map((s) => s.url)).toEqual([BOX + "/api/oauth/token"]);
     expect(JSON.parse(sent[0]!.body)).toEqual({
       grant_type: "authorization_code",
@@ -138,6 +152,23 @@ describe("finishConnect", () => {
     expect(sent).toEqual([]);
   });
 
+  it("takes an older box's never-expiring token as it is", async () => {
+    const { http } = spy(200, `{"access_token":"plum_pat_old","token_type":"bearer","scope":"files:read files:write"}`);
+    const out = await finishConnect(PENDING, { code: "C1", state: "STATE-1", iss: BOX }, http);
+    expect(out).toEqual({
+      kind: "connected",
+      iss: BOX,
+      tokens: { accessToken: "plum_pat_old", tokenType: "bearer", scope: "files:read files:write" },
+    });
+  });
+
+  it("says so when the box does not know the app-folder scope", async () => {
+    const { sent, http } = spy();
+    const out = await finishConnect(PENDING, { error: "invalid_scope", state: "STATE-1", iss: BOX }, http);
+    expect(out).toEqual({ kind: "stopped", reason: "invalid_scope" });
+    expect(sent).toEqual([]);
+  });
+
   it("reports a refused exchange", async () => {
     const { http } = spy(400, `{"error":"invalid_grant","message":"code used"}`);
     const out = await finishConnect(PENDING, { code: "C1", state: "STATE-1", iss: BOX }, http);
@@ -180,13 +211,15 @@ describe("forgetUncheckedBox", () => {
 });
 
 describe("vendored @plumbox/client", () => {
-  it("is a build that checks iss and state (0.3.0 or later)", () => {
+  it("is a build that checks iss and state and refreshes tokens (0.4.0 or later)", () => {
     expect(typeof sdk.isPlumIssuer).toBe("function");
     expect(typeof sdk.callbackFromParams).toBe("function");
+    expect(typeof sdk.refreshTokens).toBe("function");
+    expect(typeof sdk.PlumForbiddenError).toBe("function");
     const pkg = JSON.parse(readFileSync(join(__dirname, "..", "vendor", "plumbox-client", "package.json"), "utf8")) as {
       version: string;
     };
     const [major, minor] = pkg.version.split(".").map(Number) as [number, number];
-    expect(major > 0 || minor >= 3).toBe(true);
+    expect(major > 0 || minor >= 4).toBe(true);
   });
 });
