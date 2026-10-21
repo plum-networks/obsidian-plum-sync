@@ -1,29 +1,51 @@
 import { Plugin, type ObsidianProtocolData } from "obsidian";
-import { DEFAULT_SETTINGS, type PlumSyncSettings } from "./types.js";
+import type { PlumClient } from "@plumbox/client";
+import { DEFAULT_SETTINGS, type Connection, type PlumSyncSettings } from "./types.js";
 import { PlumSyncSettingTab } from "./settings-tab.js";
 import { SyncEngine } from "./sync/engine.js";
-import { completeConnect, isConnected } from "./plum.js";
-import { parseCallback } from "@plumbox/client";
+import { completeConnect, connectionEnded, http, isConnected } from "./plum.js";
+import { forgetUncheckedBox } from "./connect.js";
+import {
+  activeConnection,
+  ConnectionStore,
+  openClient,
+  remoteRootFor,
+  saveRotatedTokens,
+  type ActiveConnection,
+} from "./connection.js";
 
 const CHANGE_DEBOUNCE_MS = 8000;
 
 export default class PlumSyncPlugin extends Plugin {
   settings!: PlumSyncSettings;
   engine!: SyncEngine;
+  /** This device's connection (per-vault local storage; data.json only on old Obsidian). */
+  store!: ConnectionStore;
+
+  /**
+   * One client per connection, shared by every sync: the SDK refreshes the
+   * access token once for all requests in flight, which only works if they go
+   * through the same client. A second client would refresh with a refresh
+   * token the first one already rotated away.
+   */
+  private client: PlumClient | null = null;
+  private clientFor: string | null = null;
 
   private autoSyncTimer: number | null = null;
   private changeTimer: number | null = null;
 
   async onload(): Promise<void> {
+    this.store = new ConnectionStore(
+      this.app,
+      () => this.settings,
+      () => this.saveSettings(),
+    );
     await this.loadSettings();
     this.engine = new SyncEngine(this);
 
-    // Deep link back from the plumbox.me sign-in: obsidian://plum-sync?code=&iss=&state=
+    // Deep link back from the box after sign-in: obsidian://plum-sync?code=&iss=&state=
     this.registerObsidianProtocolHandler("plum-sync", async (params: ObsidianProtocolData) => {
-      const cb = parseCallback(
-        "obsidian://plum-sync?" + new URLSearchParams(params as Record<string, string>).toString(),
-      );
-      const ok = await completeConnect(this, cb);
+      const ok = await completeConnect(this, params);
       if (ok && this.settings.syncOnChange) void this.engine.run();
     });
 
@@ -59,10 +81,86 @@ export default class PlumSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     // Never carry a half-finished OAuth request across reloads.
     this.settings.pending = this.settings.pending ?? null;
+    // A connection 0.1 saved from an unchecked iss is dropped: reconnect.
+    if (forgetUncheckedBox(this.settings)) await this.saveSettings();
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  /** The connection this device uses, or null when not connected. */
+  connection(): ActiveConnection | null {
+    return activeConnection(this.store, this.settings);
+  }
+
+  /** The client for the current connection (the same one until it changes). */
+  getClient(): PlumClient | null {
+    const conn = this.connection();
+    if (!conn) {
+      this.client = this.clientFor = null;
+      return null;
+    }
+    if (this.client && this.clientFor === conn.id) return this.client;
+    this.client = openClient(conn, {
+      http,
+      saveTokens: (id, tokens) => saveRotatedTokens(this.store, id, tokens),
+      ended: (c, err) => void connectionEnded(this, c, err),
+    });
+    this.clientFor = conn.id;
+    return this.client;
+  }
+
+  /** The drive folder this vault syncs to (an app-folder connection: <appFolder>/<vault>). */
+  remoteRoot(conn: ActiveConnection | null = this.connection()): string {
+    return remoteRootFor(conn, this.settings, this.app.vault.getName());
+  }
+
+  /**
+   * Adopt a new sign-in as this device's connection. It replaces a 0.2-era
+   * token in data.json: that one is shared by every device the vault syncs to,
+   * and each of them now connects once on its own.
+   */
+  async setConnection(conn: Connection): Promise<void> {
+    this.client = this.clientFor = null;
+    await this.store.save(conn);
+    if (this.settings.token) {
+      this.settings.token = "";
+      this.settings.account = "";
+      this.settings.baseUrl = "";
+      await this.saveSettings();
+    }
+  }
+
+  /** Record the account name of connection `id`, if it is still the current one. */
+  async updateAccount(id: string, account: string): Promise<void> {
+    const stored = this.store.load();
+    if (stored && stored.id === id) await this.store.save({ ...stored, account });
+  }
+
+  /**
+   * Forget `conn` if it is still the one in use (not a newer sign-in made
+   * meanwhile). Returns true when it did.
+   */
+  async dropConnection(conn: ActiveConnection): Promise<boolean> {
+    if (this.clientFor === conn.id) this.client = this.clientFor = null;
+    if (conn.kind === "legacy") {
+      if (this.settings.token !== conn.accessToken) return false;
+      this.settings.token = "";
+      this.settings.account = "";
+      await this.saveSettings();
+      return true;
+    }
+    const stored = this.store.load();
+    if (!stored || stored.id !== conn.id) return false;
+    await this.store.save(null);
+    return true;
+  }
+
+  /** Disconnect this device (the user's choice in settings). */
+  async disconnect(): Promise<void> {
+    const conn = this.connection();
+    if (conn) await this.dropConnection(conn);
   }
 
   /** (Re)arm the interval timer from the current settings. */

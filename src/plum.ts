@@ -1,113 +1,103 @@
 import { requestUrl, Notice } from "obsidian";
-import {
-  PlumClient,
-  injectedAdapter,
-  beginAuthorization,
-  exchangeCode,
-  type CallbackResult,
-} from "@plumbox/client";
-import { CLIENT_ID, CLIENT_NAME, REDIRECT_URI } from "./types.js";
+import { injectedAdapter, type PlumAuthError } from "@plumbox/client";
+import { beginConnect, finishConnect } from "./connect.js";
+import { connectionFromTokens, mayReadProfile, type ActiveConnection } from "./connection.js";
 import type PlumSyncPlugin from "./main.js";
+
+/** Obsidian's requestUrl: bypasses CORS on desktop and mobile. */
+export const http = injectedAdapter(requestUrl);
 
 /**
  * Delegated ("Sign in with Plum") authorization. The password is NEVER typed in
- * Obsidian: we open plumbox.me in the system browser, the user signs in and
- * approves there, and the box deep-links back with a code we trade — via PKCE —
- * for a scoped token. See RFC 8252.
+ * Obsidian: the system browser opens plumbox.me, where the user finds their box
+ * with their email and a code Plum mails them; they type the password only on
+ * that box's own page and approve there. The box deep-links back with a code
+ * we trade — via PKCE — for a scoped token. See RFC 8252.
  */
 export async function startConnect(plugin: PlumSyncPlugin): Promise<void> {
-  const req = await beginAuthorization({
-    clientId: CLIENT_ID,
-    clientName: CLIENT_NAME,
-    redirectUri: REDIRECT_URI,
-    scopes: ["read", "write"], // never "admin"
-  });
+  const { url, pending } = await beginConnect();
   // Keep the verifier + state until the deep-link returns.
-  plugin.settings.pending = { verifier: req.codeVerifier, state: req.state };
+  plugin.settings.pending = pending;
   await plugin.saveSettings();
 
   // Open in the SYSTEM BROWSER, never an in-app webview — the user must see the
-  // real plumbox.me address bar. Obsidian routes external URLs to the OS browser
-  // on desktop and mobile alike.
-  window.open(req.url, "_blank");
-  new Notice("Opened plumbox.me to sign in. Approve access, then return to Obsidian.");
+  // real plumbox.me, and then their box's own address, in the address bar.
+  // Obsidian routes external URLs to the OS browser on desktop and mobile alike.
+  window.open(url, "_blank");
+  new Notice("Opened plumbox.me. Find your Plum Box, sign in on its page and allow access, then come back to Obsidian.");
 }
 
 /**
  * Handle the obsidian://plum-sync?code=&iss=&state= deep link fired after the
- * user approves on plumbox.me. Verifies state, exchanges the code for a token,
- * and persists {baseUrl, token}. Returns true on success.
+ * user approves on their box. The code goes only to the box a checked `iss`
+ * names, and only for the sign-in started here; the tokens are then kept as
+ * this device's connection. Returns true on success.
  */
 export async function completeConnect(
   plugin: PlumSyncPlugin,
-  params: CallbackResult,
+  params: Record<string, unknown>,
 ): Promise<boolean> {
   const pending = plugin.settings.pending;
   plugin.settings.pending = null; // one-shot, whatever happens
 
-  if (!pending) {
-    new Notice("Plum: no sign-in was in progress. Try Connect again.");
-    await plugin.saveSettings();
-    return false;
-  }
-  if (params.state !== pending.state) {
-    new Notice("Plum: sign-in could not be verified (state mismatch). Try again.");
-    await plugin.saveSettings();
-    return false;
-  }
-  if (params.error || !params.code || !params.iss) {
-    new Notice(`Plum: sign-in was cancelled${params.error ? ` (${params.error})` : ""}.`);
+  const outcome = await finishConnect(pending, params, http);
+  if (outcome.kind === "stopped") {
+    switch (outcome.reason) {
+      case "no_pending":
+        new Notice("Plum: no sign-in was in progress. Try Connect again.");
+        break;
+      case "invalid_iss":
+        new Notice("Plum: this sign-in did not come from a Plum Box, so it was stopped. Nothing was sent. Try Connect again.");
+        break;
+      case "invalid_state":
+        new Notice("Plum: this is not the sign-in you started here, so it was stopped. Try Connect again.");
+        break;
+      case "invalid_scope":
+        new Notice("Plum: your box does not offer this plugin its own folder yet. Update your Plum Box, then connect again.");
+        break;
+      case "cancelled":
+        new Notice(`Plum: sign-in was cancelled${outcome.detail ? ` (${outcome.detail})` : ""}.`);
+        break;
+      default:
+        new Notice(`Plum: could not complete sign-in — ${outcome.detail ?? "please try again"}`);
+    }
     await plugin.saveSettings();
     return false;
   }
 
-  try {
-    const { accessToken } = await exchangeCode({
-      baseUrl: params.iss,
-      code: params.code,
-      codeVerifier: pending.verifier,
-      clientId: CLIENT_ID,
-      redirectUri: REDIRECT_URI,
-      http: injectedAdapter(requestUrl),
-    });
-    plugin.settings.baseUrl = params.iss;
-    plugin.settings.token = accessToken;
-
-    // Best-effort: record which account this is, for the settings display.
+  const conn = connectionFromTokens(outcome.iss, outcome.tokens);
+  await plugin.setConnection(conn);
+  await plugin.saveSettings();
+  // Best-effort: record which account this is, for the settings display.
+  // Only when the box granted user:profile — otherwise it would answer 403.
+  if (mayReadProfile(conn)) {
     try {
-      const me = await buildClient(plugin)!.auth.me();
-      plugin.settings.account = me.email ?? me.username ?? "";
+      const me = await plugin.getClient()!.auth.me();
+      await plugin.updateAccount(conn.id, me.email ?? me.username ?? "");
     } catch {
       /* non-fatal — the token still works for drive */
     }
-    await plugin.saveSettings();
-    new Notice("Connected to your Plum Box.");
-    return true;
-  } catch (e) {
-    new Notice(`Plum: could not complete sign-in — ${(e as Error).message}`);
-    await plugin.saveSettings();
-    return false;
+  }
+  new Notice("Connected to your Plum Box.");
+  return true;
+}
+
+/**
+ * The box no longer takes this connection: the refresh was refused (it was
+ * disconnected in box settings, or not used for 90 days) or a token without
+ * a refresh token was rejected. Called once per connection by the SDK —
+ * never for a 403, which only means "not allowed".
+ */
+export async function connectionEnded(plugin: PlumSyncPlugin, conn: ActiveConnection, err: PlumAuthError): Promise<void> {
+  console.warn("plum-sync: the box ended the connection", err);
+  const dropped = await plugin.dropConnection(conn);
+  if (dropped) {
+    new Notice(
+      "Plum: your box no longer accepts this device's connection (it was revoked, or not used for 90 days). Connect again in settings.",
+    );
   }
 }
 
-/** Build a PlumClient from stored credentials, or null if not connected. */
-export function buildClient(plugin: PlumSyncPlugin): PlumClient | null {
-  const { baseUrl, token } = plugin.settings;
-  if (!baseUrl || !token) return null;
-  return new PlumClient({
-    baseUrl,
-    token,
-    http: injectedAdapter(requestUrl),
-    onAuthError: () => {
-      // Token revoked/expired: drop it so the UI prompts a reconnect.
-      plugin.settings.token = "";
-      plugin.settings.account = "";
-      void plugin.saveSettings();
-      new Notice("Plum: access was revoked. Reconnect from settings.");
-    },
-  });
-}
-
 export function isConnected(plugin: PlumSyncPlugin): boolean {
-  return !!plugin.settings.baseUrl && !!plugin.settings.token;
+  return plugin.connection() !== null;
 }

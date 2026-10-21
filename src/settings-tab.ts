@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type PlumSyncPlugin from "./main.js";
-import { startConnect, isConnected } from "./plum.js";
+import { startConnect } from "./plum.js";
 
 export class PlumSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: PlumSyncPlugin) {
@@ -12,31 +12,42 @@ export class PlumSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     // --- Connection --------------------------------------------------------
-    const connected = isConnected(this.plugin);
+    const conn = this.plugin.connection();
+    const connected = conn !== null;
     new Setting(containerEl).setName("Connection").setHeading();
 
     const status = new Setting(containerEl).setName(
       connected ? "Connected" : "Not connected",
     );
-    if (connected) {
-      status.setDesc(
-        `Signed in${this.plugin.settings.account ? ` as ${this.plugin.settings.account}` : ""} · ${this.plugin.settings.baseUrl}`,
-      );
+    if (conn) {
+      const who = conn.account ? ` as ${conn.account}` : "";
+      const where =
+        conn.kind === "legacy"
+          ? "Connected by an earlier version of this plugin, for every device this vault syncs to. Connect again to give this device its own connection, limited to the plugin's own folder."
+          : this.plugin.store.deviceLocal
+            ? "This device's own connection — each device you use connects once."
+            : "Update Obsidian to keep this connection on this device only.";
+      status.setDesc(`Signed in${who} · ${conn.iss}. ${where}`);
+      if (conn.kind === "legacy") {
+        status.addButton((b) =>
+          b.setButtonText("Connect again").onClick(async () => {
+            await startConnect(this.plugin);
+          }),
+        );
+      }
       status.addButton((b) =>
         b
           .setButtonText("Disconnect")
           .setWarning()
           .onClick(async () => {
-            this.plugin.settings.token = "";
-            this.plugin.settings.account = "";
-            await this.plugin.saveSettings();
-            new Notice("Plum: disconnected. Your token can also be revoked in box settings.");
+            await this.plugin.disconnect();
+            new Notice("Plum: disconnected this device. You can also remove the plugin's access in your box settings.");
             this.display();
           }),
       );
     } else {
       status.setDesc(
-        "You'll sign in on plumbox.me in your browser. This plugin never sees your password — only a scoped token you can revoke.",
+        "Your browser opens plumbox.me to find your Plum Box, and you type your password only on your box's own page. This plugin never sees it — it gets access to its own folder on your box, which you can take back in your box settings. Each device you use connects once.",
       );
       status.addButton((b) =>
         b
@@ -51,10 +62,12 @@ export class PlumSyncSettingTab extends PluginSettingTab {
     // --- Sync --------------------------------------------------------------
     new Setting(containerEl).setName("Sync").setHeading();
 
-    new Setting(containerEl)
-      .setName("Remote folder")
-      .setDesc("Drive folder this vault maps to on your box.")
-      .addText((t) =>
+    const remote = new Setting(containerEl).setName("Remote folder");
+    if (conn?.appFolder) {
+      // The token reaches only its app folder, so the folder is not a choice.
+      remote.setDesc(`Your box gave this plugin its own folder. This vault syncs to ${this.plugin.remoteRoot(conn)}.`);
+    } else if (conn) {
+      remote.setDesc("Drive folder this vault maps to on your box.").addText((t) =>
         t
           .setPlaceholder(this.plugin.engine.defaultRoot())
           .setValue(this.plugin.settings.remoteRoot)
@@ -63,6 +76,9 @@ export class PlumSyncSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+    } else {
+      remote.setDesc("Your box gives this plugin its own folder when you connect; the vault syncs to a folder with its name in there.");
+    }
 
     new Setting(containerEl)
       .setName("Auto-sync interval")

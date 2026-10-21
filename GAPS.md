@@ -21,9 +21,9 @@ None blocked the MVP.
    + local walk + hash. Fine for typical vaults, O(n) per sync. A
    `GET /api/drive/changes?since=<cursor>` would make large vaults cheap.
    → highest-value follow-up.
-2. **`parseCallback` takes a URL string only.** Obsidian's protocol handler
-   delivers params as an object, so the plugin rebuilds a query string just to
-   parse it back. A `parseCallbackParams(record)` overload would be tidier.
+2. ~~**`parseCallback` takes a URL string only.**~~ Done in `@plumbox/client`
+   0.3.0: `callbackFromParams(params)` reads the protocol handler's object with
+   the same `iss` check, and the plugin uses it.
 3. **Legacy remote files without a `hash`.** When `hash` is absent (file indexed
    before hashing, or written by another tool), the engine can't do an exact
    compare and falls back to "treat as changed". A box-side backfill of
